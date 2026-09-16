@@ -1,0 +1,29 @@
+[project]
+name = "lanbox-tui"
+version = "0.1.0"
+description = "Modern Linux/Unix TUI client for LanBox DMX controllers"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.60",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+lanbox-tui = "lanbox_tui.tui.app:run"
+lanbox-simulator = "lanbox_tui.simulator.server:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

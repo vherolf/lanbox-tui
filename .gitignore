@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Vendor manuals - copyrighted by LanBox Products, kept locally for reference
+# only, not redistributed via this repo.
+*.pdf
