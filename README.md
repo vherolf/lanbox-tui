@@ -137,6 +137,63 @@ grid feature set from v1.
   it's the only way to control per-Channel Solo (unlike the `LayerNextCue`
   -style commands skipped in v2, there's no equivalent alternate path).
 
+### Done (v5)
+
+**Global/Device Settings** - the LanBox's own identity/network/DMX-output
+configuration can now be read and changed from the TUI, not just its Layers
+and Channels.
+
+- [x] Commands: `CommonGetGlobalData` (`0B`, prefix-only - see note below),
+  `CommonSetName` (`AE`), `CommonSetPassword` (`AF`), `CommonSetDMXOffset`
+  (`6A`), `CommonSetNumDMXChannels` (`69`), `CommonSetIpConfig` (`B0`),
+  `CommonSetBaudRate` (`0006` - the *other* 4-hex-char command code besides
+  `CommonGetAppID`), plus the persistence actions `CommonSaveData` (`A9`) and
+  `CommonReboot` (`B5`).
+- [x] New Global Settings screen (`d` from the main screen): rename the
+  device, change its password, DMX out offset/channel count, IP/subnet/
+  gateway (one combined prompt, since `CommonSetIpConfig` sets all three at
+  once), and cycle through the 4 documented baud rates - plus Save/Reboot.
+- Note: `CommonGetGlobalData`'s real reply also covers DMX Input routing,
+  UDP In/Out config, and clock/NTP settings (~18 more fields) - this batch's
+  parser only decodes the prefix through Standard Gateway, since that's all
+  this screen needs; the rest is left for the UDP networking / DMX input
+  features later.
+- Another confirmed vendor-doc typo (same pattern as `LayerSetFadeTime` in
+  v3): `CommonGetGlobalData`'s own worked example computes IP `C0A8014C` =
+  192.168.1.**76**, but its caption says ".77" - trusted the bytes, which
+  the separate `CommonSetIpConfig` example (same bytes) correctly captions.
+
+### Done (v6)
+
+**Serial/USB transport** - the LanBox can now be reached the same way LCedit+
+always could, over its USB-serial connection, not just TCP.
+
+- [x] `transport/serial.py` - `SerialTransport`, wrapping the blocking
+  `pyserial` library through `asyncio.to_thread` so it doesn't block the
+  event loop, matching `Transport`'s existing `connect`/`write`/`read`/
+  `close` interface (`transport/base.py`, unchanged since v1 - this is
+  exactly the second implementation it was written to support).
+- [x] The Connect screen has one new field, `Serial device[:baud]` - leave
+  it blank for TCP (unchanged), or fill in e.g. `/dev/ttyUSB0` or
+  `/dev/ttyUSB0:9600` to connect over serial instead.
+- [x] `lanbox-simulator` gained a `--serial DEVICE [--baud N]` mode, so the
+  whole serial path can be exercised locally (e.g. against a `socat`- or
+  Python-`pty`-created device pair) before ever touching real hardware.
+- **Open protocol question, resolved with a documented, safe default**: the
+  reference chart's password-handshake description sits specifically under
+  "Network Connection", not "Serial Connection" - read as meaning serial
+  skips the password step entirely. `Transport` gained a `requires_auth`
+  class attribute (`True` by default, `False` on `SerialTransport`) that
+  `LanBoxClient.connect()` checks; sending the password over serial anyway
+  would be harmless (framing rules discard anything before the first `*`),
+  but *not* sending it avoids hanging forever if a real serial LanBox never
+  replies to it. **Needs real-hardware confirmation.**
+- Tested against a real OS pty pair (Python's `pty` module) end-to-end,
+  including a full `LanBoxClient` session (connect/get_app_id/get_layers/
+  channel read-write) over actual `pyserial` I/O - see
+  `tests/test_serial_transport.py`. No real hardware or external tools
+  required to run the tests.
+
 ### Not yet implemented
 
 Everything else LCedit+ does. Grouped by area, referencing the reference
@@ -150,20 +207,15 @@ chart's own command names so it's traceable back to the spec:
 - **MIDI**: per-layer MIDI settings (`LayerSetDeviceID`, `LayerSetSustain`,
   `LayerIgnoreNoteOff`), MIDI mapping (`CommonGet/Set/StoreMIDIMapping`),
   MIDI Show Control, Note/CC/Program Change control surfaces.
-- **Global/device settings UI**: IP config, DMX offset/channel count, device
-  name, password, serial baud rate, gain/curves/slopes, patcher
-  (`CommonGetGlobalData`, `CommonSetIpConfig`, `CommonSetDMXOffset`,
-  `CommonSetNumDMXChannels`, `CommonSetName`, `CommonSetPassword`,
-  `CommonSetBaudRate`, gain/curve/slope commands, `Common*Patcher`).
-- **UDP networking**: bulk channel streaming and Art-Net bridging
-  (`CommonSetUdpIn`, `CommonSetUdpOut`) - v1 only uses the TCP command
-  channel.
-- **Serial/USB transport**: the LanBox enumerates as a USB-serial modem;
-  only TCP is implemented so far (`transport/base.py` is already abstracted
-  for this).
-- **Persistence**: `CommonSaveData` (flush RAM to flash), `CommonReboot`,
-  `CommonResetNonVolatile`, firmware upload, backup/restore.
-- **Debug commands**: `DebugGetTotalUsage`, `DebugGetFreeList`,
+- **DMX Input routing, UDP networking, clock/NTP, 16-bit channel pairing,
+  digital-output patching, and gain/curve/slope dimmer shaping**:
+  `CommonSetDmxIn`, `CommonSetUdpIn`/`Out` (also needed for Art-Net
+  bridging), `CommonSetTime`, `CommonGet/Set/Store16BitTable`,
+  `CommonGet/SetDigOutPatcher`, and the gain/curve/slope commands - all part
+  of `CommonGetGlobalData`'s reply but not decoded/edited yet (see the v5
+  note above).
+- **Remaining persistence/debug commands**: `CommonResetNonVolatile`,
+  firmware upload, backup/restore, `DebugGetTotalUsage`, `DebugGetFreeList`,
   `DebugGetCuelistUsage` - low priority, mainly useful for troubleshooting.
 - **LCedit-level UX concepts** that sit above the raw protocol: a Fixture
   library/patch table (naming Channels after real fixtures/parameters
@@ -201,10 +253,17 @@ At the connect screen, use host `127.0.0.1`, port `1777`, password `777`
 
 ## Running against real hardware
 
-Same as above, but point `lanbox-tui` at the LanBox's actual IP address
+Over the network, point `lanbox-tui` at the LanBox's actual IP address
 (factory default `192.168.1.77`, port `777`, password `777`) instead of the
-simulator. No separate setup needed - it's the same protocol either way.
-This has not been tried against a real LanBox yet.
+simulator - no separate setup needed, it's the same protocol either way.
+
+Over USB/serial, plug in the LanBox and fill in its device path (e.g.
+`/dev/ttyUSB0`) in the Connect screen's "Serial device[:baud]" field instead
+- see the README's "Implementation status" (v6) for the one open question
+here (whether a real LanBox expects a password over serial at all).
+
+**None of this has been tried against real LanBox hardware yet** - both
+paths are only verified against the simulator/pty so far.
 
 ## Testing
 
@@ -214,5 +273,7 @@ pytest
 
 Covers wire-framing round-trips, each command's encode/decode against
 worked examples from the reference PDF, a full simulator+client
-integration test, and a headless Textual smoke test that drives the actual
-TUI screens against the simulator.
+integration test, a serial-transport integration test against a real OS
+pty pair (no real hardware or external tools needed), and a headless
+Textual smoke test that drives the actual TUI screens against the
+simulator (both the TCP and serial connect paths).

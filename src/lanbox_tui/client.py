@@ -40,11 +40,12 @@ class LanBoxClient:
 
     async def connect(self) -> None:
         await self._transport.connect()
-        await self._transport.write(framing.encode_password(self._password))
-        reply = await self._read_one_reply()
-        if not reply.ok:
-            await self._transport.close()
-            raise AuthenticationError("LanBox rejected the connection password")
+        if self._transport.requires_auth:
+            await self._transport.write(framing.encode_password(self._password))
+            reply = await self._read_one_reply()
+            if not reply.ok:
+                await self._transport.close()
+                raise AuthenticationError("LanBox rejected the connection password")
         self._connected = True
 
     async def close(self) -> None:
@@ -268,3 +269,46 @@ class LanBoxClient:
     async def move_layer_above(self, destination: int, source: int) -> None:
         request = commands.build_layer_configure_short(destination, source)
         commands.parse_layer_configure(await self._request(request))
+
+    # --- LanBox Global Settings ---
+
+    async def get_global_data(self) -> commands.GlobalData:
+        reply = await self._request(commands.build_get_global_data())
+        return commands.parse_get_global_data(reply)
+
+    async def set_name(self, name: str) -> None:
+        reply = await self._request(commands.build_set_name(name))
+        commands.parse_set_name(reply)
+
+    async def set_password(self, password: int) -> None:
+        reply = await self._request(commands.build_set_password(password))
+        commands.parse_set_password(reply)
+
+    async def set_dmx_offset(self, offset: int) -> None:
+        reply = await self._request(commands.build_set_dmx_offset(offset))
+        commands.parse_set_dmx_offset(reply)
+
+    async def set_num_dmx_channels(self, count: int) -> None:
+        reply = await self._request(commands.build_set_num_dmx_channels(count))
+        commands.parse_set_num_dmx_channels(reply)
+
+    async def set_ip_config(
+        self,
+        ip: tuple[int, int, int, int],
+        subnet: tuple[int, int, int, int],
+        gateway: tuple[int, int, int, int],
+    ) -> None:
+        reply = await self._request(commands.build_set_ip_config(ip, subnet, gateway))
+        commands.parse_set_ip_config(reply)
+
+    async def set_baud_rate(self, param: int) -> None:
+        reply = await self._request(commands.build_set_baud_rate(param))
+        commands.parse_set_baud_rate(reply)
+
+    async def reboot(self) -> None:
+        reply = await self._request(commands.build_reboot())
+        commands.parse_reboot(reply)
+
+    async def save_data(self) -> None:
+        reply = await self._request(commands.build_save_data())
+        commands.parse_save_data(reply)

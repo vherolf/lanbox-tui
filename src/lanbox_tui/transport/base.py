@@ -2,7 +2,7 @@
 
 The client and simulator both work purely in terms of this interface, so
 the same code paths run whether the peer is a real LanBox over TCP, a real
-LanBox over serial (future work), or the in-process simulator.
+LanBox over serial, or the in-process simulator.
 """
 
 from __future__ import annotations
@@ -12,6 +12,13 @@ from abc import ABC, abstractmethod
 
 class Transport(ABC):
     """A bidirectional byte stream to a LanBox (or something speaking its protocol)."""
+
+    #: Whether `LanBoxClient.connect()` should send the password handshake
+    #: over this transport. The reference chart documents the password
+    #: prompt specifically under "Network Connection", not "Serial
+    #: Connection" - see `transport/serial.py` for the reasoning behind
+    #: `SerialTransport` overriding this to `False`.
+    requires_auth: bool = True
 
     @abstractmethod
     async def connect(self) -> None:

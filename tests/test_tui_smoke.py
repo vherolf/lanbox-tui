@@ -5,15 +5,20 @@ ids, CSS typos) that the protocol-level tests can't see.
 """
 
 import asyncio
+import os
+import pty
 
 import pytest
 from textual.widgets import DataTable, Input, ListView, Static
+
+from test_serial_transport import SimulatorPeer
 
 from lanbox_tui.protocol.cue_steps import STEP_SHOW_SCENE
 from lanbox_tui.simulator.server import make_connection_handler
 from lanbox_tui.simulator.state import LanBoxState
 from lanbox_tui.tui.app import LanBoxApp
 from lanbox_tui.tui.screens.cue_lists import CueListsScreen, SceneEditorScreen
+from lanbox_tui.tui.screens.global_settings import GlobalSettingsScreen
 from lanbox_tui.tui.screens.layer_config import LayerConfigScreen
 from lanbox_tui.tui.screens.main import MainScreen
 from lanbox_tui.tui.widgets.channel_grid import ChannelGrid
@@ -369,3 +374,86 @@ async def test_channel_active_and_solo_toggles(simulator_address):
             await pilot.pause(0.1)
         assert state.layers[1].channel(1).solo_mode is True
         assert grid.get_cell("1", "solo") == "on"
+
+
+async def test_global_settings_screen_edits_apply(simulator_address):
+    host, port, state = simulator_address
+    app = LanBoxApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        main_screen = await _reach_main_screen_with_layer_a_selected(pilot, host, port)
+
+        await pilot.press("d")
+        for _ in range(10):
+            if isinstance(pilot.app.screen, GlobalSettingsScreen):
+                break
+            await pilot.pause(0.05)
+        settings_screen = pilot.app.screen
+        assert isinstance(settings_screen, GlobalSettingsScreen)
+        for _ in range(10):
+            if settings_screen.data is not None:
+                break
+            await pilot.pause(0.05)
+        assert settings_screen.data.name == state.name
+
+        await pilot.press("n")
+        await pilot.pause()
+        settings_screen.query_one("#settings-input", Input).value = "My LanBox"
+        await pilot.press("enter")
+        for _ in range(10):
+            if state.name == "My LanBox":
+                break
+            await pilot.pause(0.05)
+        assert state.name == "My LanBox"
+        assert "My LanBox" in str(settings_screen.query_one("#settings-summary", Static).render())
+
+        await pilot.press("o")
+        await pilot.pause()
+        settings_screen.query_one("#settings-input", Input).value = "256"
+        await pilot.press("enter")
+        for _ in range(10):
+            if state.dmx_out_offset == 256:
+                break
+            await pilot.pause(0.05)
+        assert state.dmx_out_offset == 256
+
+        await pilot.press("b")
+        for _ in range(10):
+            if state.baud_rate_param == 0:
+                break
+            await pilot.pause(0.05)
+        assert state.baud_rate_param == 0  # cycled from the default (3) to 0
+
+        await pilot.press("escape")
+        for _ in range(10):
+            if pilot.app.screen is main_screen:
+                break
+            await pilot.pause(0.05)
+        assert pilot.app.screen is main_screen
+
+
+async def test_connect_screen_reaches_main_screen_over_serial():
+    """Same connect flow as the TCP smoke test, but through the new
+    serial-device field - exercises _connect()'s serial branch, which has
+    no other test coverage."""
+    from lanbox_tui.simulator.state import LanBoxState
+
+    master_fd, slave_fd = pty.openpty()
+    device_path = os.ttyname(slave_fd)
+    state = LanBoxState(password="777")
+    peer = SimulatorPeer(master_fd, state)
+    try:
+        app = LanBoxApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pilot.app.screen.query_one("#serial-device", Input).value = device_path
+            await pilot.click("#connect")
+            for _ in range(10):
+                if isinstance(pilot.app.screen, MainScreen):
+                    break
+                await pilot.pause(0.05)
+            assert isinstance(pilot.app.screen, MainScreen)
+    finally:
+        peer.close()
+        os.close(slave_fd)
+        os.close(master_fd)

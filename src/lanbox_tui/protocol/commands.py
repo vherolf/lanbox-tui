@@ -642,3 +642,138 @@ def build_layer_configure_long(
 
 def parse_layer_configure(reply: Reply) -> None:
     _require_ok(reply, command="LayerConfigure")
+
+
+# --- LanBox Global Settings (reference chart pp. 7-8, 50-54) ----------------
+
+BAUD_RATE_NAMES = {0: "38400", 1: "19200", 2: "9600", 3: "31250 (MIDI)"}
+MAX_NAME_LENGTH = 13
+
+_GLOBAL_DATA_HEAD_SPEC = [
+    ("baud_rate", 1),
+    ("dmx_out_offset", 2),
+    ("dmx_channel_count", 2),
+    ("name_length", 1),
+]
+_GLOBAL_DATA_TAIL_SPEC = [
+    ("sysex_device_id", 1),
+    ("ip1", 1), ("ip2", 1), ("ip3", 1), ("ip4", 1),
+    ("sn1", 1), ("sn2", 1), ("sn3", 1), ("sn4", 1),
+    ("gw1", 1), ("gw2", 1), ("gw3", 1), ("gw4", 1),
+]
+_NAME_FIELD_BYTES = 13  # always sent as a fixed-width 13-byte field
+
+
+@dataclass(frozen=True)
+class GlobalData:
+    baud_rate_param: int
+    dmx_out_offset: int
+    dmx_channel_count: int
+    name: str
+    sysex_device_id: int
+    ip_address: tuple[int, int, int, int]
+    subnet_mask: tuple[int, int, int, int]
+    gateway: tuple[int, int, int, int]
+
+
+def build_get_global_data() -> bytes:
+    return framing.encode_request("0B")
+
+
+def parse_get_global_data(reply: Reply) -> GlobalData:
+    # Only decodes the prefix through Standard Gateway - CommonGetGlobalData's
+    # full reply also covers DMX Input/UDP/clock config, which this LanBox
+    # client doesn't manage yet (see the v5 plan's scope decisions).
+    _require_ok(reply, command="CommonGetGlobalData")
+    data = reply.data or ""
+    head, remaining = read_fields(data, _GLOBAL_DATA_HEAD_SPEC)
+    name_hex = remaining[: _NAME_FIELD_BYTES * 2]
+    remaining = remaining[_NAME_FIELD_BYTES * 2 :]
+    name_length = head["name_length"]
+    name = "".join(
+        chr(framing.parse_hex(name_hex[i : i + 2])) for i in range(0, name_length * 2, 2)
+    )
+    tail, _ = read_fields(remaining, _GLOBAL_DATA_TAIL_SPEC)
+    return GlobalData(
+        baud_rate_param=head["baud_rate"],
+        dmx_out_offset=head["dmx_out_offset"],
+        dmx_channel_count=head["dmx_channel_count"],
+        name=name,
+        sysex_device_id=tail["sysex_device_id"],
+        ip_address=(tail["ip1"], tail["ip2"], tail["ip3"], tail["ip4"]),
+        subnet_mask=(tail["sn1"], tail["sn2"], tail["sn3"], tail["sn4"]),
+        gateway=(tail["gw1"], tail["gw2"], tail["gw3"], tail["gw4"]),
+    )
+
+
+def build_set_name(name: str) -> bytes:
+    if len(name) > MAX_NAME_LENGTH:
+        raise ValueError(f"a LanBox name is at most {MAX_NAME_LENGTH} characters, got {len(name)!r}")
+    return framing.encode_request("AE", *(hex8(ord(c)) for c in name))
+
+
+def parse_set_name(reply: Reply) -> None:
+    _require_ok(reply, command="CommonSetName")
+
+
+def build_set_password(password: int) -> bytes:
+    return framing.encode_request("AF", hex16(password))
+
+
+def parse_set_password(reply: Reply) -> None:
+    _require_ok(reply, command="CommonSetPassword")
+
+
+def build_set_dmx_offset(offset: int) -> bytes:
+    return framing.encode_request("6A", hex16(offset))
+
+
+def parse_set_dmx_offset(reply: Reply) -> None:
+    _require_ok(reply, command="CommonSetDMXOffset")
+
+
+def build_set_num_dmx_channels(count: int) -> bytes:
+    return framing.encode_request("69", hex16(count))
+
+
+def parse_set_num_dmx_channels(reply: Reply) -> None:
+    _require_ok(reply, command="CommonSetNumDMXChannels")
+
+
+def build_set_ip_config(
+    ip: tuple[int, int, int, int],
+    subnet: tuple[int, int, int, int],
+    gateway: tuple[int, int, int, int],
+) -> bytes:
+    octets = (*ip, *subnet, *gateway)
+    return framing.encode_request("B0", *(hex8(octet) for octet in octets))
+
+
+def parse_set_ip_config(reply: Reply) -> None:
+    _require_ok(reply, command="CommonSetIpConfig")
+
+
+def build_set_baud_rate(param: int) -> bytes:
+    # 4-hex-char command code, like CommonGetAppID's "0005" - see the
+    # reference chart's own "Note the extra 0's in the command number".
+    return framing.encode_request("0006", hex8(param))
+
+
+def parse_set_baud_rate(reply: Reply) -> None:
+    _require_ok(reply, command="CommonSetBaudRate")
+
+
+def build_reboot() -> bytes:
+    return framing.encode_request("B5")
+
+
+def parse_reboot(reply: Reply) -> None:
+    _require_ok(reply, command="CommonReboot")
+
+
+def build_save_data() -> bytes:
+    return framing.encode_request("A9")
+
+
+def parse_save_data(reply: Reply) -> None:
+    _require_ok(reply, command="CommonSaveData")

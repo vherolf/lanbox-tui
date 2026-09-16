@@ -11,6 +11,8 @@ import argparse
 import asyncio
 import logging
 
+import serial
+
 from lanbox_tui.protocol import framing
 from lanbox_tui.protocol.cue_steps import CueStep
 from lanbox_tui.simulator.state import LanBoxState, SimulatedLayer
@@ -382,11 +384,73 @@ def _handle_layer_configure(params: str, state: LanBoxState) -> None:
         state.configure_layer(destination, source)
 
 
+# Bytes covering the DMX Input/UDP In-Out/clock fields of CommonGetGlobalData
+# that this LanBox client doesn't parse or manage yet (see the v5 plan) - kept
+# zero-filled so the simulated reply's wire format stays structurally complete.
+_GLOBAL_DATA_TAIL_ZERO_BYTES = 42
+
+
+def _handle_get_global_data(params: str, state: LanBoxState) -> str:
+    name_hex = "".join(framing.hex8(ord(c)) for c in state.name)
+    name_hex += "00" * (13 - len(state.name))
+    parts = [
+        framing.hex8(state.baud_rate_param),
+        framing.hex16(state.dmx_out_offset),
+        framing.hex16(state.dmx_channel_count),
+        framing.hex8(len(state.name)),
+        name_hex,
+        framing.hex8(state.sysex_device_id),
+        *(framing.hex8(octet) for octet in state.ip_address),
+        *(framing.hex8(octet) for octet in state.subnet_mask),
+        *(framing.hex8(octet) for octet in state.gateway),
+        "00" * _GLOBAL_DATA_TAIL_ZERO_BYTES,
+    ]
+    return "".join(parts)
+
+
+def _handle_set_name(params: str, state: LanBoxState) -> None:
+    state.name = "".join(chr(framing.parse_hex(params[i : i + 2])) for i in range(0, len(params), 2))
+
+
+def _handle_set_password(params: str, state: LanBoxState) -> None:
+    # Stored as the decimal string a user types when authenticating (a
+    # password is a 16-bit number, entered as its decimal digits).
+    state.password = str(framing.parse_hex(params))
+
+
+def _handle_set_dmx_offset(params: str, state: LanBoxState) -> None:
+    state.dmx_out_offset = framing.parse_hex(params)
+
+
+def _handle_set_num_dmx_channels(params: str, state: LanBoxState) -> None:
+    state.dmx_channel_count = framing.parse_hex(params)
+
+
+def _handle_set_ip_config(params: str, state: LanBoxState) -> None:
+    octets = [framing.parse_hex(params[i : i + 2]) for i in range(0, len(params), 2)]
+    state.ip_address = tuple(octets[0:4])
+    state.subnet_mask = tuple(octets[4:8])
+    state.gateway = tuple(octets[8:12])
+
+
+def _handle_set_baud_rate(params: str, state: LanBoxState) -> None:
+    state.baud_rate_param = framing.parse_hex(params)
+
+
+def _handle_reboot(params: str, state: LanBoxState) -> None:
+    pass  # nothing to simulate: no session teardown modeled for this scope
+
+
+def _handle_save_data(params: str, state: LanBoxState) -> None:
+    pass  # nothing to persist across simulator restarts for this scope
+
+
 _HANDLERS = {
-    # CommonGetAppID is the odd one out with a 4-hex-char code ("0005"); every
-    # other v1 command uses 2. Sorted longest-first so dispatch() can match
-    # unambiguously by trying longer codes before shorter ones.
+    # CommonGetAppID and CommonSetBaudRate are the odd ones out with 4-hex-char
+    # codes ("0005", "0006"); every other command uses 2. Sorted longest-first
+    # so dispatch() can match unambiguously by trying longer codes before shorter.
     "0005": _handle_get_app_id,
+    "0006": _handle_set_baud_rate,
     "65": _handle_set_16bit_mode,
     "B1": _handle_get_layers,
     "0A": _handle_get_layer_status,
@@ -422,6 +486,14 @@ _HANDLERS = {
     "4D": _handle_set_layer_fade_type,
     "4E": _handle_set_layer_fade_time,
     "44": _handle_layer_configure,
+    "0B": _handle_get_global_data,
+    "AE": _handle_set_name,
+    "AF": _handle_set_password,
+    "6A": _handle_set_dmx_offset,
+    "69": _handle_set_num_dmx_channels,
+    "B0": _handle_set_ip_config,
+    "B5": _handle_reboot,
+    "A9": _handle_save_data,
 }
 _HANDLER_CODES_BY_LENGTH_DESC = sorted(_HANDLERS, key=len, reverse=True)
 
@@ -495,14 +567,46 @@ async def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT, state: LanBox
         await server.serve_forever()
 
 
+def _read_serial_available(ser: serial.Serial) -> bytes:
+    first = ser.read(1)  # blocks (timeout=None) until >=1 byte or the port closes
+    if not first:
+        return b""
+    extra = ser.read(ser.in_waiting) if ser.in_waiting else b""
+    return first + extra
+
+
+async def serve_serial(device: str, baudrate: int, state: LanBoxState | None = None) -> None:
+    # Mirrors SerialTransport's requires_auth=False assumption: no password
+    # handshake over serial, just straight into request dispatch.
+    state = state or LanBoxState()
+    ser = await asyncio.to_thread(serial.Serial, device, baudrate, timeout=None)
+    logger.info("LanBox simulator listening on serial %s @ %d baud (no password over serial)", device, baudrate)
+    request_reader = RequestReader()
+    try:
+        while True:
+            chunk = await asyncio.to_thread(_read_serial_available, ser)
+            if not chunk:
+                return
+            for body in request_reader.feed(chunk):
+                await asyncio.to_thread(ser.write, dispatch(body, state))
+    finally:
+        await asyncio.to_thread(ser.close)
+
+
 def run() -> None:
-    parser = argparse.ArgumentParser(description="Fake LanBox TCP server for development/testing")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--password", default="777")
+    parser = argparse.ArgumentParser(description="Fake LanBox server for development/testing (TCP or serial)")
+    parser.add_argument("--host", default="127.0.0.1", help="TCP host to bind (ignored with --serial)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port to bind (ignored with --serial)")
+    parser.add_argument("--password", default="777", help="Password for TCP connections (serial skips it)")
+    parser.add_argument("--serial", metavar="DEVICE", help="Listen on a serial device instead of TCP, e.g. /dev/pts/3")
+    parser.add_argument("--baud", type=int, default=31250, help="Baud rate to use with --serial (default 31250)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    asyncio.run(serve(args.host, args.port, LanBoxState(password=args.password)))
+    state = LanBoxState(password=args.password)
+    if args.serial:
+        asyncio.run(serve_serial(args.serial, args.baud, state))
+    else:
+        asyncio.run(serve(args.host, args.port, state))
 
 
 if __name__ == "__main__":

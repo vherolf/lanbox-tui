@@ -60,6 +60,7 @@ class MainScreen(Screen):
         ("minus", "delete_layer", "Delete Layer"),
         ("u", "move_layer_up", "Move Layer up"),
         ("n", "move_layer_down", "Move Layer down"),
+        ("d", "open_global_settings", "Device settings"),
         ("escape", "cancel_edit", "Cancel edit"),
     ]
 
@@ -223,6 +224,11 @@ class MainScreen(Screen):
         self.app.push_screen(
             LayerConfigScreen(self.client, self.selected_layer_id, self.selected_layer_label)
         )
+
+    def action_open_global_settings(self) -> None:
+        from lanbox_tui.tui.screens.global_settings import GlobalSettingsScreen  # avoid import at module load
+
+        self.app.push_screen(GlobalSettingsScreen(self.client))
 
     def action_add_layer(self) -> None:
         self._open_prompt("add_layer", "New Layer letter, e.g. F")

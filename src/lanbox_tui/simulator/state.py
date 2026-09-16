@@ -102,6 +102,17 @@ class LanBoxState:
         self.firmware_version = firmware_version
         self.password = password
         self.sixteen_bit_mode = False
+
+        # LanBox Global Settings (documented factory defaults).
+        self.name = "LanBox LCX"
+        self.ip_address = (192, 168, 1, 77)
+        self.subnet_mask = (255, 255, 255, 0)
+        self.gateway = (192, 168, 1, 1)
+        self.dmx_out_offset = 0
+        self.dmx_channel_count = 512
+        self.baud_rate_param = 3  # 31250 baud (MIDI), the documented default
+        self.sysex_device_id = 0
+
         self.layers: dict[int, SimulatedLayer] = {}
         # Real LanBox-LCX boots with 5 active Layers, A through E.
         for offset, layer_id in enumerate(range(1, 6)):

@@ -10,6 +10,7 @@ from textual.widgets import Button, Footer, Header, Input, Label, Static
 
 from lanbox_tui.client import LanBoxClient
 from lanbox_tui.protocol.errors import LanBoxError
+from lanbox_tui.transport.serial import DEFAULT_BAUDRATE, SerialTransport
 from lanbox_tui.transport.tcp import DEFAULT_PORT, TcpTransport
 
 
@@ -39,6 +40,10 @@ class ConnectScreen(Screen):
             yield Input(placeholder="Host (e.g. 192.168.1.77 or localhost)", id="host")
             yield Input(placeholder=f"Port (default {DEFAULT_PORT})", id="port")
             yield Input(placeholder="Password (default 777)", password=True, id="password")
+            yield Input(
+                placeholder=f"Serial device[:baud] e.g. /dev/ttyUSB0 (default {DEFAULT_BAUDRATE}) - blank for TCP",
+                id="serial-device",
+            )
             yield Button("Connect", variant="primary", id="connect")
             yield Static("", id="status")
         yield Footer()
@@ -56,17 +61,28 @@ class ConnectScreen(Screen):
 
     async def _connect(self) -> None:
         status = self.query_one("#status", Static)
-        host = self.query_one("#host", Input).value.strip() or "127.0.0.1"
-        port_text = self.query_one("#port", Input).value.strip()
-        password = self.query_one("#password", Input).value.strip() or "777"
-        try:
-            port = int(port_text) if port_text else DEFAULT_PORT
-        except ValueError:
-            status.update("Port must be a number")
-            return
+        serial_device = self.query_one("#serial-device", Input).value.strip()
+
+        if serial_device:
+            device_path, _, baud_text = serial_device.partition(":")
+            try:
+                baudrate = int(baud_text) if baud_text else DEFAULT_BAUDRATE
+            except ValueError:
+                status.update("Baud rate must be a number")
+                return
+            client = LanBoxClient(SerialTransport(device_path, baudrate))
+        else:
+            host = self.query_one("#host", Input).value.strip() or "127.0.0.1"
+            port_text = self.query_one("#port", Input).value.strip()
+            password = self.query_one("#password", Input).value.strip() or "777"
+            try:
+                port = int(port_text) if port_text else DEFAULT_PORT
+            except ValueError:
+                status.update("Port must be a number")
+                return
+            client = LanBoxClient(TcpTransport(host, port), password=password)
 
         status.update("Connecting...")
-        client = LanBoxClient(TcpTransport(host, port), password=password)
         try:
             await client.connect()
             await client.set_16bit_mode(True)
