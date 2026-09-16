@@ -1,6 +1,6 @@
 [project]
 name = "lanbox-tui"
-version = "0.1.0"
+version = "1.0.0"
 description = "Modern Linux/Unix TUI client for LanBox DMX controllers"
 requires-python = ">=3.10"
 dependencies = [
