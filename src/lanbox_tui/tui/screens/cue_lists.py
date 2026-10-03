@@ -15,6 +15,19 @@ from lanbox_tui.protocol.errors import LanBoxError
 from lanbox_tui.tui.widgets.channel_grid import ChannelGrid
 
 
+def _in_range(value: int, low: int, high: int, what: str) -> int:
+    if not low <= value <= high:
+        raise ValueError(f"{what} must be {low}-{high}")
+    return value
+
+
+def _seconds(text: str) -> float:
+    value = float(text)
+    if not 0 <= value <= 3600:  # also rejects nan/inf
+        raise ValueError("times must be 0-3600 seconds")
+    return value
+
+
 class SceneEditorScreen(Screen):
     """Edit the (sparse) Channel values that make up one Show Scene step."""
 
@@ -53,7 +66,7 @@ class SceneEditorScreen(Screen):
         status = self.query_one("#scene-status", Static)
         try:
             self.values = await self.client.read_cue_scene(self.cue_list, self.cue_step)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Failed to load scene: {exc}")
             return
         self._refresh_grid()
@@ -120,7 +133,7 @@ class SceneEditorScreen(Screen):
             return
         try:
             await self.client.write_cue_scene(self.cue_list, self.cue_step, self.values)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Save failed: {exc}")
             return
         status.update(f"Saved ({len(self.values)} channel(s))")
@@ -195,7 +208,7 @@ class CueListsScreen(Screen):
         status = self.query_one("#cue-status", Static)
         try:
             directory = await self.client.get_cue_list_directory()
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Failed to load Cue Lists: {exc}")
             return
         table = self.query_one("#cue-list-table", DataTable)
@@ -213,7 +226,7 @@ class CueListsScreen(Screen):
         status = self.query_one("#cue-status", Static)
         try:
             self.steps = await self.client.read_cue_list(cue_list)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Failed to load steps: {exc}")
             return
         self._refresh_steps_table()
@@ -279,17 +292,18 @@ class CueListsScreen(Screen):
             return
         try:
             if pending == "new_cue_list":
-                self.run_worker(self._create_cue_list(int(text)), exclusive=False)
+                self.run_worker(self._create_cue_list(_in_range(int(text), 1, 999, "Cue List")), exclusive=False)
             elif pending == "add_show_scene":
                 fade_text, hold_text = (part.strip() for part in text.split(",", 1))
                 step = CueStep.show_scene(
-                    fade_type=3, fade_seconds=float(fade_text), hold_seconds=float(hold_text)
+                    fade_type=3, fade_seconds=_seconds(fade_text), hold_seconds=_seconds(hold_text)
                 )
                 self.run_worker(self._append_step(step), exclusive=False)
             elif pending == "add_go_step":
-                self.run_worker(self._append_step(CueStep.go_cue_step(int(text))), exclusive=False)
+                target = _in_range(int(text), 1, MAX_CUE_STEPS_PER_LIST, "step")
+                self.run_worker(self._append_step(CueStep.go_cue_step(target)), exclusive=False)
             elif pending == "add_hold":
-                self.run_worker(self._append_step(CueStep.hold(float(text))), exclusive=False)
+                self.run_worker(self._append_step(CueStep.hold(_seconds(text))), exclusive=False)
         except ValueError as exc:
             status.update(f"Invalid input: {exc}")
 
@@ -301,7 +315,7 @@ class CueListsScreen(Screen):
             # CueListWrite creates the list if it doesn't exist yet; a Cue List
             # can't be written with zero steps, so seed it with a placeholder.
             await self.client.write_cue_list(cue_list, [CueStep.hold(1.0)])
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Create failed: {exc}")
             return
         await self._load_directory()
@@ -316,7 +330,7 @@ class CueListsScreen(Screen):
         status = self.query_one("#cue-status", Static)
         try:
             await self.client.remove_cue_list(cue_list)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Delete failed: {exc}")
             return
         self.selected_cue_list = None
@@ -334,7 +348,7 @@ class CueListsScreen(Screen):
             return
         try:
             await self.client.write_cue_list(self.selected_cue_list, new_steps)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Add step failed: {exc}")
             return
         await self._load_steps(self.selected_cue_list)
@@ -349,7 +363,7 @@ class CueListsScreen(Screen):
         status = self.query_one("#cue-status", Static)
         try:
             await self.client.remove_cue_list_step(cue_list, index)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Delete step failed: {exc}")
             return
         await self._load_steps(cue_list)

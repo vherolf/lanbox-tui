@@ -417,12 +417,19 @@ async def test_global_settings_screen_edits_apply(simulator_address):
             await pilot.pause(0.05)
         assert state.dmx_out_offset == 256
 
+        summary = settings_screen.query_one("#settings-summary", Static)
+        assert "MIDI (31250 baud)" in str(summary.render())  # factory default 0x83, not "131"
         await pilot.press("b")
         for _ in range(10):
-            if state.baud_rate_param == 0:
+            if state.baud_rate_param == 0x02:
                 break
             await pilot.pause(0.05)
-        assert state.baud_rate_param == 0  # cycled from the default (3) to 0
+        assert state.baud_rate_param == 0x02  # MIDI mode -> serial out at 9600
+        for _ in range(10):
+            if "9600" in str(summary.render()):
+                break
+            await pilot.pause(0.05)
+        assert "9600" in str(summary.render())
 
         await pilot.press("escape")
         for _ in range(10):
@@ -457,3 +464,131 @@ async def test_connect_screen_reaches_main_screen_over_serial():
         peer.close()
         os.close(slave_fd)
         os.close(master_fd)
+
+
+# --- Regression scenarios from the 2026-10 audit (see tests/test_regressions.py) ---
+
+
+async def test_main_screen_follows_a_renamed_layer(simulator_address):
+    host, port, state = simulator_address
+    app = LanBoxApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        main_screen = await _reach_main_screen_with_layer_a_selected(pilot, host, port)
+        await pilot.press("l")
+        for _ in range(10):
+            if isinstance(pilot.app.screen, LayerConfigScreen):
+                break
+            await pilot.pause(0.05)
+        layer_screen = pilot.app.screen
+        for _ in range(10):
+            if layer_screen.attributes is not None:
+                break
+            await pilot.pause(0.05)
+        await pilot.press("r")
+        await pilot.pause()
+        layer_screen.query_one("#layer-input", Input).value = "Z"
+        await pilot.press("enter")
+        for _ in range(10):
+            if 26 in state.layers:
+                break
+            await pilot.pause(0.05)
+        await pilot.press("escape")
+        list_view = main_screen.query_one("#layers", ListView)
+        for _ in range(20):
+            if main_screen.selected_layer_id == 26 and any(i.layer_label == "Z" for i in list_view.children):
+                break
+            await pilot.pause(0.05)
+        assert main_screen.selected_layer_id == 26
+        assert [item.layer_label for item in list_view.children][0] == "Z"
+        await pilot.pause(0.5)  # a few poll cycles against the renamed Layer
+        assert "Poll failed" not in str(main_screen.query_one("#grid-status", Static).render())
+
+
+async def test_too_long_device_name_is_rejected_without_crashing(simulator_address):
+    host, port, state = simulator_address
+    app = LanBoxApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _reach_main_screen_with_layer_a_selected(pilot, host, port)
+        await pilot.press("d")
+        for _ in range(10):
+            if isinstance(pilot.app.screen, GlobalSettingsScreen) and pilot.app.screen.data is not None:
+                break
+            await pilot.pause(0.05)
+        settings_screen = pilot.app.screen
+        await pilot.press("n")
+        await pilot.pause()
+        settings_screen.query_one("#settings-input", Input).value = "a name that is far too long"
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        assert pilot.app.is_running
+        assert "Invalid input" in str(settings_screen.query_one("#settings-message", Static).render())
+        assert state.name == "LanBox LCX"
+
+
+async def test_out_of_range_go_is_rejected_without_crashing(simulator_address):
+    host, port, _state = simulator_address
+    app = LanBoxApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        main_screen = await _reach_main_screen_with_layer_a_selected(pilot, host, port)
+        await pilot.press("g")
+        await pilot.pause()
+        main_screen.query_one("#value-input", Input).value = "5.300"
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        assert pilot.app.is_running
+        assert "step 0-99" in str(main_screen.query_one("#grid-status", Static).render())
+
+
+async def test_lost_connection_is_reported_instead_of_crashing(simulator_address):
+    host, port, _state = simulator_address
+    app = LanBoxApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        main_screen = await _reach_main_screen_with_layer_a_selected(pilot, host, port)
+
+        async def reset_by_peer(max_bytes: int = 4096) -> bytes:
+            raise ConnectionResetError("simulated: LanBox rebooted")
+
+        main_screen.client._transport.read = reset_by_peer
+        status = main_screen.query_one("#grid-status", Static)
+        for _ in range(20):
+            if "Connection lost" in str(status.render()):
+                break
+            await pilot.pause(0.05)
+        assert pilot.app.is_running
+        assert "Connection lost" in str(status.render())
+
+
+async def test_cue_list_with_out_of_table_time_code_displays(simulator_address):
+    from lanbox_tui.protocol.cue_steps import CueStep
+
+    host, port, state = simulator_address
+    # Show Scene with fade code 0x00, which isn't in Appendix A's table.
+    state.cue_lists[1] = [CueStep(wait=False, kind=0x01, params=(0, 0x00, 0x1B, 0, 0, 0))]
+    app = LanBoxApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _reach_main_screen_with_layer_a_selected(pilot, host, port)
+        await pilot.press("c")
+        for _ in range(10):
+            if isinstance(pilot.app.screen, CueListsScreen):
+                break
+            await pilot.pause(0.05)
+        cue_screen = pilot.app.screen
+        directory = cue_screen.query_one("#cue-list-table", DataTable)
+        for _ in range(10):
+            if directory.row_count:
+                break
+            await pilot.pause(0.05)
+        directory.focus()
+        await pilot.press("enter")
+        steps_table = cue_screen.query_one("#steps-table", DataTable)
+        for _ in range(10):
+            if steps_table.row_count:
+                break
+            await pilot.pause(0.05)
+        assert pilot.app.is_running
+        assert "code 0x00" in str(steps_table.get_cell("1", "description"))

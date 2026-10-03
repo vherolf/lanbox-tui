@@ -67,10 +67,10 @@ async def test_mix_chase_and_fade_values_round_trip(simulator):
         status = await client.get_layer_status(1)
         assert status.mix_status == 4
         assert status.chase_mode == 2
-        assert status.layer_speed_percent == 170
+        assert status.layer_speed == 170
         assert status.manual_fade_type == 3
         assert status.manual_fade_time_code == 0x1B
-        assert status.transparency_depth_percent == 51
+        assert status.transparency_depth == 51
     finally:
         await client.close()
 

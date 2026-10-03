@@ -41,7 +41,7 @@ class ConnectScreen(Screen):
             yield Input(placeholder=f"Port (default {DEFAULT_PORT})", id="port")
             yield Input(placeholder="Password (default 777)", password=True, id="password")
             yield Input(
-                placeholder=f"Serial device[:baud] e.g. /dev/ttyUSB0 (default {DEFAULT_BAUDRATE}) - blank for TCP",
+                placeholder="USB device, e.g. /dev/ttyACM0 or /dev/cu.usbmodem… - blank for TCP",
                 id="serial-device",
             )
             yield Button("Connect", variant="primary", id="connect")

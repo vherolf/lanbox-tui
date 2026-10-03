@@ -1,11 +1,13 @@
 """Serial/USB transport - the LanBox enumerates as a USB-serial modem.
 
 pyserial is a blocking library, so every call is pushed through
-`asyncio.to_thread` to avoid blocking the event loop. Unverified against
-real hardware: whether a real LanBox skips the password handshake over
-serial (see `requires_auth` below and `transport/base.py`) and what baud
-rate a factory-fresh box expects before any `CommonSetBaudRate` has been
-issued.
+`asyncio.to_thread` to avoid blocking the event loop.
+
+The LanBox installs as a "USB modem" (LCedit manual p.5), i.e. a USB CDC-ACM
+device, for which the serial baud rate is nominal and ignored. It is NOT
+related to `CommonSetBaudRate`, which configures the MIDI port (5-pin DIN).
+Unverified against real hardware: whether a real LanBox skips the password
+handshake over USB (see `requires_auth` below and `transport/base.py`).
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import serial
 
 from lanbox_tui.transport.base import Transport
 
-DEFAULT_BAUDRATE = 31250  # MIDI rate - the documented LanBox default
+DEFAULT_BAUDRATE = 115200  # nominal: USB CDC-ACM ignores it (see module docstring)
 
 
 class SerialTransport(Transport):

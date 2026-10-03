@@ -71,6 +71,9 @@ class MainScreen(Screen):
         self.selected_layer_id: int | None = None
         self.selected_layer_label: str | None = None
         self._pending_action: str | None = None
+        self._suspended = False
+        self._poll_in_flight = False
+        self._connection_lost_shown = False
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -86,7 +89,7 @@ class MainScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.run_worker(self._load_layers(), exclusive=True)
+        self._reload_layers()
         self.set_interval(POLL_INTERVAL_SECONDS, self._poll_channels)
 
     async def on_unmount(self) -> None:
@@ -94,17 +97,43 @@ class MainScreen(Screen):
         # matters both for a clean app quit and for tests tearing down a simulator.
         await self.client.close()
 
+    def on_screen_suspend(self) -> None:
+        self._suspended = True
+
+    def on_screen_resume(self) -> None:
+        # Back from a sub-screen that may have renamed/deleted/created Layers.
+        if self._suspended:
+            self._suspended = False
+            self._reload_layers()
+
+    def _reload_layers(self) -> None:
+        # Pass the function, not a coroutine: a superseded worker that never
+        # started would otherwise leave an un-awaited coroutine behind.
+        self.run_worker(self._load_layers, group="layers", exclusive=True)
+
     async def _load_layers(self) -> None:
         status = self.query_one("#grid-status", Static)
         try:
             layers = await self.client.get_layers()
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Failed to load Layers: {exc}")
             return
         list_view = self.query_one("#layers", ListView)
         await list_view.clear()
         for layer in layers:
             await list_view.append(LayerListItem(layer))
+        if self.selected_layer_id is None:
+            return
+        ids = [layer.layer_id for layer in layers]
+        if self.selected_layer_id in ids:
+            index = ids.index(self.selected_layer_id)
+            list_view.index = index
+            self.selected_layer_label = layers[index].label
+            status.update(f"Layer {self.selected_layer_label}")
+        else:
+            self.selected_layer_id = None
+            self.selected_layer_label = None
+            status.update("That Layer no longer exists - select a Layer")
 
     @on(ListView.Selected, "#layers")
     def handle_layer_selected(self, event: ListView.Selected) -> None:
@@ -117,9 +146,18 @@ class MainScreen(Screen):
         grid.focus()
 
     async def _poll_channels(self) -> None:
-        if self.selected_layer_id is None:
+        # Skip while a sub-screen is on top (its own requests take priority)
+        # and while a previous poll is still waiting for its reply.
+        if self.selected_layer_id is None or self._suspended or self._poll_in_flight:
+            return
+        status = self.query_one("#grid-status", Static)
+        if not self.client.connected:
+            if not self._connection_lost_shown:
+                status.update("Connection lost - quit (Ctrl+Q) and reconnect")
+                self._connection_lost_shown = True
             return
         grid = self.query_one("#grid", ChannelGrid)
+        self._poll_in_flight = True
         try:
             values = await self.client.read_channel_data(
                 self.selected_layer_id, grid.window_start, grid.window_size
@@ -127,9 +165,15 @@ class MainScreen(Screen):
             statuses = await self.client.read_channel_status(
                 self.selected_layer_id, grid.window_start, grid.window_size
             )
-        except LanBoxError as exc:
-            self.query_one("#grid-status", Static).update(f"Poll failed: {exc}")
+        except (LanBoxError, ValueError) as exc:
+            if self.client.connected:
+                status.update(f"Poll failed: {exc}")
+            else:
+                status.update(f"Connection lost ({exc}) - quit (Ctrl+Q) and reconnect")
+                self._connection_lost_shown = True
             return
+        finally:
+            self._poll_in_flight = False
         grid.update_values(values, statuses)
 
     def action_page_prev(self) -> None:
@@ -163,7 +207,7 @@ class MainScreen(Screen):
             statuses = await self.client.read_channel_status(layer_id, channel, 1)
             currently_on = getattr(statuses[channel], status_attr)
             await setter(layer_id, {channel: not currently_on})
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#grid-status", Static).update(f"Toggle failed: {exc}")
 
     def action_edit_value(self) -> None:
@@ -189,7 +233,7 @@ class MainScreen(Screen):
                 await self.client.layer_resume(layer_id)
             else:
                 await self.client.layer_pause(layer_id)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#grid-status", Static).update(f"Pause/resume failed: {exc}")
 
     def action_next_step(self) -> None:
@@ -208,7 +252,7 @@ class MainScreen(Screen):
                 await self.client.layer_next_step(layer_id)
             else:
                 await self.client.layer_previous_step(layer_id)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#grid-status", Static).update(f"Step failed: {exc}")
 
     def action_open_cue_lists(self) -> None:
@@ -222,8 +266,15 @@ class MainScreen(Screen):
         from lanbox_tui.tui.screens.layer_config import LayerConfigScreen  # avoid import at module load
 
         self.app.push_screen(
-            LayerConfigScreen(self.client, self.selected_layer_id, self.selected_layer_label)
+            LayerConfigScreen(self.client, self.selected_layer_id, self.selected_layer_label),
+            callback=self._after_layer_config,
         )
+
+    def _after_layer_config(self, layer_id: int | None) -> None:
+        # LayerConfigScreen returns the Layer's ID, which changes on rename.
+        if layer_id is not None:
+            self.selected_layer_id = layer_id
+        self._reload_layers()
 
     def action_open_global_settings(self) -> None:
         from lanbox_tui.tui.screens.global_settings import GlobalSettingsScreen  # avoid import at module load
@@ -245,7 +296,7 @@ class MainScreen(Screen):
     async def _create_layer(self, layer_id: int) -> None:
         try:
             await self.client.create_layer(layer_id)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#grid-status", Static).update(f"Add Layer failed: {exc}")
             return
         await self._load_layers()
@@ -258,11 +309,12 @@ class MainScreen(Screen):
     async def _delete_layer(self, layer_id: int) -> None:
         try:
             await self.client.delete_layer(layer_id)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#grid-status", Static).update(f"Delete Layer failed: {exc}")
             return
         self.selected_layer_id = None
         self.selected_layer_label = None
+        self.query_one("#grid-status", Static).update("Layer deleted - select a Layer")
         await self._load_layers()
 
     def action_move_layer_up(self) -> None:
@@ -279,7 +331,7 @@ class MainScreen(Screen):
         status = self.query_one("#grid-status", Static)
         try:
             layers = await self.client.get_layers()
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Move failed: {exc}")
             return
         ids = [layer.layer_id for layer in layers]
@@ -294,7 +346,7 @@ class MainScreen(Screen):
                 await self.client.move_layer_above(destination=neighbor_id, source=layer_id)
             else:
                 await self.client.move_layer_above(destination=layer_id, source=neighbor_id)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             status.update(f"Move failed: {exc}")
             return
         await self._load_layers()
@@ -349,7 +401,7 @@ class MainScreen(Screen):
     async def _set_channel(self, layer_id: int, channel: int, value: int) -> None:
         try:
             await self.client.set_channel_data(layer_id, {channel: value})
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#grid-status", Static).update(f"Set failed: {exc}")
 
     def _submit_layer_go(self, text: str) -> None:
@@ -365,10 +417,14 @@ class MainScreen(Screen):
         except ValueError:
             status.update(f"Invalid Cue List[.Step]: {text!r}")
             return
+        # LayerGo: Cue List 1-999 (0 resets the Layer), step 0-99 (p.26).
+        if not 0 <= cue_list <= 999 or (cue_step is not None and not 0 <= cue_step <= 99):
+            status.update("Cue List must be 0-999 and step 0-99")
+            return
         self.run_worker(self._layer_go(self.selected_layer_id, cue_list, cue_step), exclusive=False)
 
     async def _layer_go(self, layer_id: int, cue_list: int, cue_step: int | None) -> None:
         try:
             await self.client.layer_go(layer_id, cue_list, cue_step)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#grid-status", Static).update(f"Go failed: {exc}")

@@ -255,6 +255,12 @@ def _handle_remove_cue_list_step(params: str, state: LanBoxState) -> None:
             state.cue_scenes[(list_id, step_index - 1)] = scene
 
 
+# Frame limits from the reference chart (CueListRead/Write p.39/41,
+# CueSceneRead/Write p.40/42). Longer lists/scenes need multiple frames.
+_CUE_STEPS_PER_FRAME = 70
+_CUE_SCENE_VALUES_PER_FRAME = 250
+
+
 def _handle_read_cue_list(params: str, state: LanBoxState) -> str:
     cue_list = framing.parse_hex(params[0:4])
     start_step = framing.parse_hex(params[4:6])
@@ -262,28 +268,43 @@ def _handle_read_cue_list(params: str, state: LanBoxState) -> str:
     steps = state.cue_lists.get(cue_list)
     if steps is None:
         raise ValueError(f"no such cue list: {cue_list}")
-    selected = steps[start_step - 1 :] if count == 0 else steps[start_step - 1 : start_step - 1 + count]
+    if start_step > len(steps) and not (start_step == 1 and not steps):
+        raise ValueError(f"cue list {cue_list} has no step {start_step}")
+    wanted = _CUE_STEPS_PER_FRAME if count == 0 else min(count, _CUE_STEPS_PER_FRAME)
+    selected = steps[start_step - 1 : start_step - 1 + wanted]
     return "".join(step.to_hex() for step in selected)
 
 
 def _handle_write_cue_list(params: str, state: LanBoxState) -> None:
+    # First frame: count = total steps of the list (replaces it). Continuation
+    # frames: count = 0, steps are appended (reference chart p.41).
     cue_list = framing.parse_hex(params[0:4])
     count = framing.parse_hex(params[4:6])
     body = params[6:]
-    steps = [CueStep.from_hex(body[i : i + 14]) for i in range(0, count * 14, 14)]
-    state.cue_lists[cue_list] = steps
-    for key in [k for k in state.cue_scenes if k[0] == cue_list and k[1] > len(steps)]:
+    steps = [CueStep.from_hex(body[i : i + 14]) for i in range(0, len(body) - len(body) % 14, 14)]
+    if len(steps) > _CUE_STEPS_PER_FRAME:
+        raise ValueError(f"frame carries {len(steps)} steps, max {_CUE_STEPS_PER_FRAME}")
+    if count:
+        state.cue_lists[cue_list] = steps
+    else:
+        state.cue_lists.setdefault(cue_list, []).extend(steps)
+    if len(state.cue_lists[cue_list]) > 99:
+        raise ValueError("a cue list holds at most 99 steps")
+    total = len(state.cue_lists[cue_list])
+    for key in [k for k in state.cue_scenes if k[0] == cue_list and k[1] > total]:
         del state.cue_scenes[key]
 
 
 def _handle_read_cue_scene(params: str, state: LanBoxState) -> str:
+    # CHNR in the reply is the number of values in the whole scene, not in
+    # this reply (reference chart p.40) - the client pages with a start channel.
     cue_list = framing.parse_hex(params[0:4])
     cue_step = framing.parse_hex(params[4:6])
     start_channel = framing.parse_hex(params[6:10]) if len(params) > 6 else 1
     scene = state.cue_scenes.get((cue_list, cue_step), {})
     channels = sorted(channel for channel in scene if channel >= start_channel)
-    page = channels[:250]
-    parts = [framing.hex8(0), framing.hex16(len(page))]
+    page = channels[:_CUE_SCENE_VALUES_PER_FRAME]
+    parts = [framing.hex8(0), framing.hex16(len(scene))]
     for channel in page:
         parts.append(framing.hex16(channel))
         parts.append(framing.hex8(scene[channel]))
@@ -291,16 +312,20 @@ def _handle_read_cue_scene(params: str, state: LanBoxState) -> str:
 
 
 def _handle_write_cue_scene(params: str, state: LanBoxState) -> None:
+    # First frame: count = total values in the scene (replaces it).
+    # Continuation frames: count = 0, values are added (reference chart p.42).
     cue_list = framing.parse_hex(params[0:4])
     cue_step = framing.parse_hex(params[4:6])
     # params[6:8] is the always-zero Cue Scene Flag - ignored.
     count = framing.parse_hex(params[8:12])
-    body = params[12:]
+    pairs = _hex_pairs(params[12:], 6)
+    if len(pairs) > _CUE_SCENE_VALUES_PER_FRAME:
+        raise ValueError(f"frame carries {len(pairs)} values, max {_CUE_SCENE_VALUES_PER_FRAME}")
+    if count:
+        state.cue_scenes[(cue_list, cue_step)] = {}
     scene = state.cue_scenes.setdefault((cue_list, cue_step), {})
-    for pair in _hex_pairs(body, 6)[:count]:
-        channel = framing.parse_hex(pair[0:4])
-        value = framing.parse_hex(pair[4:6])
-        scene[channel] = value
+    for pair in pairs:
+        scene[framing.parse_hex(pair[0:4])] = framing.parse_hex(pair[4:6])
 
 
 def _set_layer_bool(params: str, state: LanBoxState, attr: str) -> None:
@@ -599,7 +624,10 @@ def run() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port to bind (ignored with --serial)")
     parser.add_argument("--password", default="777", help="Password for TCP connections (serial skips it)")
     parser.add_argument("--serial", metavar="DEVICE", help="Listen on a serial device instead of TCP, e.g. /dev/pts/3")
-    parser.add_argument("--baud", type=int, default=31250, help="Baud rate to use with --serial (default 31250)")
+    parser.add_argument(
+        "--baud", type=int, default=115200,
+        help="Baud rate for --serial (default 115200; must match the client's, a real LanBox's USB ignores it)",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     state = LanBoxState(password=args.password)

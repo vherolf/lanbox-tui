@@ -8,8 +8,13 @@ from textual.screen import Screen
 from textual.widgets import Footer, Input, Static
 
 from lanbox_tui.client import LanBoxClient
-from lanbox_tui.protocol.commands import LayerAttributes, LayerStatus
-from lanbox_tui.protocol.cue_steps import decode_cue_time
+from lanbox_tui.protocol.commands import (
+    LayerAttributes,
+    LayerStatus,
+    chase_speed_percent,
+    transparency_percent,
+)
+from lanbox_tui.protocol.cue_steps import format_cue_time
 from lanbox_tui.protocol.errors import LanBoxError
 from lanbox_tui.protocol.framing import layer_label_to_id
 
@@ -24,8 +29,9 @@ _FADE_TYPE_NAMES = {
 }
 
 
-def _format_seconds(seconds: float | None) -> str:
-    return "forever" if seconds is None else f"{seconds:.2f}s"
+def _format_speed(raw: int) -> str:
+    percent = chase_speed_percent(raw)
+    return f"{raw} (max, frame rate)" if percent is None else f"{raw} ({percent:.0f}%)"
 
 
 def _on_off(value: bool) -> str:
@@ -93,7 +99,7 @@ class LayerConfigScreen(Screen):
             self.attributes = matching.attributes
             self.layer_label = matching.label
             self.layer_status = await self.client.get_layer_status(self.layer_id)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             message.update(f"Failed to load Layer: {exc}")
             return
         self._refresh_summary()
@@ -101,7 +107,7 @@ class LayerConfigScreen(Screen):
     def _refresh_summary(self) -> None:
         assert self.attributes is not None and self.layer_status is not None
         attrs, status = self.attributes, self.layer_status
-        fade_seconds = decode_cue_time(status.manual_fade_time_code)
+        transparency = f"{status.transparency_depth} ({transparency_percent(status.transparency_depth):.0f}%)"
         lines = [
             f"Layer {self.layer_label} (id {self.layer_id})",
             "",
@@ -111,11 +117,11 @@ class LayerConfigScreen(Screen):
             f"[4] Auto Output:  {_on_off(attrs.auto_activate)}",
             f"[5] Locked:       {_on_off(attrs.locked)}",
             f"[m] Mix Mode:     {_MIX_MODE_NAMES.get(status.mix_status, status.mix_status)}",
-            f"[t] Transparency: {status.transparency_depth_percent}",
+            f"[t] Transparency: {transparency}",
             f"[c] Chase Mode:   {_CHASE_MODE_NAMES.get(status.chase_mode, status.chase_mode)}",
-            f"[v] Chase Speed:  {status.layer_speed_percent}",
+            f"[v] Chase Speed:  {_format_speed(status.layer_speed)}",
             f"[f] Fade Type:    {_FADE_TYPE_NAMES.get(status.manual_fade_type, status.manual_fade_type)}",
-            f"[d] Fade Time:    {_format_seconds(fade_seconds)}",
+            f"[d] Fade Time:    {format_cue_time(status.manual_fade_time_code)}",
             "[r] Rename...",
         ]
         self.query_one("#layer-summary", Static).update("\n".join(lines))
@@ -128,7 +134,7 @@ class LayerConfigScreen(Screen):
         current = getattr(self.attributes, attr_name)
         try:
             await setter(self.layer_id, not current)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#layer-message", Static).update(f"Change failed: {exc}")
             return
         await self._load()
@@ -157,7 +163,7 @@ class LayerConfigScreen(Screen):
         new_value = (current + 1) % (max_value + 1)
         try:
             await setter(self.layer_id, new_value)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#layer-message", Static).update(f"Change failed: {exc}")
             return
         await self._load()
@@ -199,7 +205,8 @@ class LayerConfigScreen(Screen):
             box.remove_class("visible")
             self._pending_action = None
             return
-        self.app.pop_screen()
+        # Hand back the (possibly renamed) Layer ID so the main screen can follow it.
+        self.dismiss(self.layer_id)
 
     @on(Input.Submitted, "#layer-input")
     def handle_input_submitted(self, event: Input.Submitted) -> None:
@@ -222,7 +229,10 @@ class LayerConfigScreen(Screen):
                     raise ValueError("must be 0-255")
                 self.run_worker(self._apply(self.client.set_layer_chase_speed, value), exclusive=False)
             elif pending == "fade_time":
-                self.run_worker(self._apply(self.client.set_layer_fade_time, float(text)), exclusive=False)
+                seconds = float(text)
+                if not 0 <= seconds <= 3600:
+                    raise ValueError("must be 0-3600 seconds")
+                self.run_worker(self._apply(self.client.set_layer_fade_time, seconds), exclusive=False)
             elif pending == "rename":
                 self.run_worker(self._rename(layer_label_to_id(text)), exclusive=False)
         except ValueError as exc:
@@ -231,7 +241,7 @@ class LayerConfigScreen(Screen):
     async def _apply(self, setter, value) -> None:
         try:
             await setter(self.layer_id, value)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#layer-message", Static).update(f"Change failed: {exc}")
             return
         await self._load()
@@ -239,7 +249,7 @@ class LayerConfigScreen(Screen):
     async def _rename(self, new_id: int) -> None:
         try:
             await self.client.set_layer_id(self.layer_id, new_id)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#layer-message", Static).update(f"Rename failed: {exc}")
             return
         self.layer_id = new_id

@@ -1,4 +1,4 @@
-"""Global/Device Settings screen: name, network, DMX output, baud rate."""
+"""Global/Device Settings screen: name, network, DMX output, MIDI port mode."""
 
 from __future__ import annotations
 
@@ -8,10 +8,21 @@ from textual.screen import Screen
 from textual.widgets import Footer, Input, Static
 
 from lanbox_tui.client import LanBoxClient
-from lanbox_tui.protocol.commands import BAUD_RATE_NAMES, GlobalData, MAX_NAME_LENGTH
+from lanbox_tui.protocol.commands import (
+    BAUD_RATE_OPTIONS,
+    MAX_NAME_LENGTH,
+    GlobalData,
+    describe_baud_rate,
+)
 from lanbox_tui.protocol.errors import LanBoxError
 
-_BAUD_RATE_ORDER = sorted(BAUD_RATE_NAMES)
+
+def _validate_name(text: str) -> str:
+    if len(text) > MAX_NAME_LENGTH:
+        raise ValueError(f"at most {MAX_NAME_LENGTH} characters, got {len(text)}")
+    if not all(32 <= ord(c) <= 126 for c in text):
+        raise ValueError("only plain ASCII characters are allowed")
+    return text
 
 
 def _format_address(octets: tuple[int, int, int, int]) -> str:
@@ -43,7 +54,7 @@ class GlobalSettingsScreen(Screen):
         ("o", "prompt_dmx_offset", "DMX Offset"),
         ("c", "prompt_dmx_channels", "DMX Channels"),
         ("i", "prompt_ip_config", "IP Config"),
-        ("b", "cycle_baud_rate", "Baud Rate"),
+        ("b", "cycle_baud_rate", "MIDI port"),
         ("s", "save_data", "Save"),
         ("r", "reboot", "Reboot"),
         ("escape", "close_or_cancel", "Back"),
@@ -68,7 +79,7 @@ class GlobalSettingsScreen(Screen):
         message = self.query_one("#settings-message", Static)
         try:
             self.data = await self.client.get_global_data()
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             message.update(f"Failed to load settings: {exc}")
             return
         self._refresh_summary()
@@ -76,7 +87,6 @@ class GlobalSettingsScreen(Screen):
     def _refresh_summary(self) -> None:
         assert self.data is not None
         data = self.data
-        baud_name = BAUD_RATE_NAMES.get(data.baud_rate_param, str(data.baud_rate_param))
         lines = [
             "LanBox Global Settings",
             "",
@@ -87,13 +97,14 @@ class GlobalSettingsScreen(Screen):
             f"    Gateway:       {_format_address(data.gateway)}",
             f"[o] DMX Out Offset: {data.dmx_out_offset}",
             f"[c] DMX Channels:  {data.dmx_channel_count}",
-            f"[b] Baud Rate:     {baud_name}",
+            f"[b] MIDI port:     {describe_baud_rate(data.baud_rate_param)}",
             "",
             "[s] Save to flash   [r] Reboot",
             "",
-            "Note: IP/password/baud rate changes need a Save + Reboot to take",
-            "effect on real hardware, and the reference chart warns to change",
-            "IP/password 'with extreme care'.",
+            "Notes: name, IP and MIDI-port changes need Save + Reboot to take",
+            "effect. The reference chart warns to change IP/password 'with",
+            "extreme care'. The MIDI port setting is the 5-pin DIN socket",
+            "(MIDI, or a serial output with MIDI off) - it does not affect USB.",
         ]
         self.query_one("#settings-summary", Static).update("\n".join(lines))
 
@@ -151,7 +162,7 @@ class GlobalSettingsScreen(Screen):
             return
         try:
             if pending == "rename":
-                self.run_worker(self._apply(self.client.set_name, text), exclusive=False)
+                self.run_worker(self._apply(self.client.set_name, _validate_name(text)), exclusive=False)
             elif pending == "password":
                 value = int(text)
                 if not 0 <= value <= 65535:
@@ -177,7 +188,7 @@ class GlobalSettingsScreen(Screen):
     async def _apply(self, setter, value) -> None:
         try:
             await setter(value)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#settings-message", Static).update(f"Change failed: {exc}")
             return
         await self._load()
@@ -185,7 +196,7 @@ class GlobalSettingsScreen(Screen):
     async def _apply_ip_config(self, ip, subnet, gateway) -> None:
         try:
             await self.client.set_ip_config(ip, subnet, gateway)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#settings-message", Static).update(f"Change failed: {exc}")
             return
         await self._load()
@@ -198,15 +209,12 @@ class GlobalSettingsScreen(Screen):
     async def _cycle_baud_rate(self) -> None:
         if self.data is None:
             return
-        current_index = (
-            _BAUD_RATE_ORDER.index(self.data.baud_rate_param)
-            if self.data.baud_rate_param in _BAUD_RATE_ORDER
-            else -1
-        )
-        new_param = _BAUD_RATE_ORDER[(current_index + 1) % len(_BAUD_RATE_ORDER)]
+        current = self.data.baud_rate_param
+        current_index = BAUD_RATE_OPTIONS.index(current) if current in BAUD_RATE_OPTIONS else -1
+        new_param = BAUD_RATE_OPTIONS[(current_index + 1) % len(BAUD_RATE_OPTIONS)]
         try:
             await self.client.set_baud_rate(new_param)
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             self.query_one("#settings-message", Static).update(f"Change failed: {exc}")
             return
         await self._load()
@@ -218,7 +226,7 @@ class GlobalSettingsScreen(Screen):
         message = self.query_one("#settings-message", Static)
         try:
             await self.client.save_data()
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             message.update(f"Save failed: {exc}")
             return
         message.update("Saved to flash.")
@@ -230,7 +238,7 @@ class GlobalSettingsScreen(Screen):
         message = self.query_one("#settings-message", Static)
         try:
             await self.client.reboot()
-        except LanBoxError as exc:
+        except (LanBoxError, ValueError) as exc:
             message.update(f"Reboot failed: {exc}")
             return
-        message.update("Reboot requested.")
+        message.update("Reboot requested - the connection will drop; reconnect once the LanBox is back.")

@@ -55,13 +55,9 @@ controlled.
   re-writing a list that uses a type the TUI doesn't specially understand.
 - [x] Commands: `CueListGetDirectory` (`A7`), `CueListRead` (`AB`),
   `CueListWrite` (`AA`), `CueListRemove` (`60`), `CueListRemoveStep` (`62`),
-  `CueSceneRead` (`AD`), `CueSceneWrite` (`AC`) - directory paging (>80 lists)
-  and Cue Scene paging (>250 channel values) are both implemented in
-  `client.py`. Cue Lists themselves are capped at 99 steps and sent/read in a
-  single message - the reference chart's wording on multi-frame chunking for
-  longer lists is internally ambiguous and untestable without real hardware,
-  so it's deliberately not implemented (flagged for revisiting once hardware
-  is available).
+  `CueSceneRead` (`AD`), `CueSceneWrite` (`AC`). (v2 got multi-frame
+  transfers - Cue Lists over 70 steps, scenes over 250 values - wrong; fixed
+  in v7, see below.)
 - [x] Layer playback: `LayerGo` (`56`), `LayerClear` (`57`), `LayerPause`
   (`58`), `LayerResume` (`59`), `LayerNextStep` (`5A`), `LayerPreviousStep`
   (`5B`).
@@ -152,7 +148,8 @@ and Channels.
 - [x] New Global Settings screen (`d` from the main screen): rename the
   device, change its password, DMX out offset/channel count, IP/subnet/
   gateway (one combined prompt, since `CommonSetIpConfig` sets all three at
-  once), and cycle through the 4 documented baud rates - plus Save/Reboot.
+  once), and the MIDI port mode - plus Save/Reboot. (v5 mislabelled the
+  MIDI port setting as a general "baud rate"; corrected in v7.)
 - Note: `CommonGetGlobalData`'s real reply also covers DMX Input routing,
   UDP In/Out config, and clock/NTP settings (~18 more fields) - this batch's
   parser only decodes the prefix through Standard Gateway, since that's all
@@ -173,9 +170,10 @@ always could, over its USB-serial connection, not just TCP.
   event loop, matching `Transport`'s existing `connect`/`write`/`read`/
   `close` interface (`transport/base.py`, unchanged since v1 - this is
   exactly the second implementation it was written to support).
-- [x] The Connect screen has one new field, `Serial device[:baud]` - leave
-  it blank for TCP (unchanged), or fill in e.g. `/dev/ttyUSB0` or
-  `/dev/ttyUSB0:9600` to connect over serial instead.
+- [x] The Connect screen has one new field for the USB device - leave it
+  blank for TCP (unchanged), or fill in e.g. `/dev/ttyACM0` (Linux) or
+  `/dev/cu.usbmodem…` (macOS). An optional `:baud` suffix is accepted but
+  makes no difference to a real LanBox (see v7).
 - [x] `lanbox-simulator` gained a `--serial DEVICE [--baud N]` mode, so the
   whole serial path can be exercised locally (e.g. against a `socat`- or
   Python-`pty`-created device pair) before ever touching real hardware.
@@ -193,6 +191,53 @@ always could, over its USB-serial connection, not just TCP.
   channel read-write) over actual `pyserial` I/O - see
   `tests/test_serial_transport.py`. No real hardware or external tools
   required to run the tests.
+
+### Done (v7) - fixes from a second pass over the PDFs
+
+A re-read of the reference chart and LCedit manual against the code found
+these problems (all fixed, each with a regression test that failed on the
+old code first - `tests/test_regressions.py` plus scenarios in
+`tests/test_tui_smoke.py`):
+
+- **Crashes on real-world events.** Network errors (e.g. the reset a LanBox
+  reboot causes) and malformed replies weren't `LanBoxError`s, so they
+  escaped every screen's error handling and took the app down; a bad reply
+  also wedged the stream permanently. Now: network errors become
+  `ConnectionLostError`, framing errors are `LanBoxError`s, stray bytes
+  before a reply (e.g. an undocumented password banner) are discarded the
+  same way the LanBox discards bytes before a request, and every request has
+  a timeout (default 5 s) instead of hanging forever. The main screen shows
+  "Connection lost" instead of crashing. The client also no longer drops a
+  second reply that arrives in the same network packet.
+- **Crashes on unusual device data or typed input.** Cue Step descriptions
+  crashed on time codes outside Appendix A's table (e.g. `0x00`) and on Layer
+  IDs outside 1-63; out-of-range input (a 14+ character device name, Go
+  `5.300`, a jump target over 255) crashed inside background workers. A jump
+  target over 255 would even have produced a corrupt frame. All now
+  validated or displayed safely.
+- **The "baud rate" setting is the MIDI port's** (LCedit manual p.57: the
+  5-pin DIN socket, MIDI or a 9600-baud serial *output*), not the USB link's.
+  A real box reports `0x83` = MIDI mode, which the settings screen showed as
+  "131" and which `b` would switch off. It's now shown and cycled as "MIDI
+  port" (MIDI first). The LanBox's USB is a CDC "USB modem", for which baud
+  rate is irrelevant; v5/v6 docs claiming otherwise are corrected.
+- **Multi-frame Cue List / Cue Scene transfers.** v2 called the reference
+  chart's instructions "internally inconsistent"; they aren't. The first
+  frame declares the *total* count, continuation frames declare 0 - the old
+  code put a per-frame count in every frame, which a real box would likely
+  treat as a new list/scene. Reads of long lists now page in 70-step frames,
+  and scene reads use the header's *total* count (the old loop would have
+  spun forever on a real box with more than 250 values). The simulator now
+  enforces the same frame limits and replace-vs-append semantics, so the
+  tests mean something.
+- **Stale main screen after renaming/deleting a Layer** in its settings
+  screen: it kept polling the old Layer ID ("Poll failed" every 200 ms) and
+  showed the old name. It now follows the rename and reloads the Layer list
+  whenever a sub-screen closes.
+- Smaller: transparency/chase speed are shown with their real percentages
+  (128/(255-S) for speed), `create_layer(above=...)` became `under=...`
+  (which is what LayerConfigure actually does), and Cue List directory
+  paging is now correct whichever way the chart's "Cue List Index" is meant.
 
 ### Not yet implemented
 
@@ -257,10 +302,16 @@ Over the network, point `lanbox-tui` at the LanBox's actual IP address
 (factory default `192.168.1.77`, port `777`, password `777`) instead of the
 simulator - no separate setup needed, it's the same protocol either way.
 
-Over USB/serial, plug in the LanBox and fill in its device path (e.g.
-`/dev/ttyUSB0`) in the Connect screen's "Serial device[:baud]" field instead
-- see the README's "Implementation status" (v6) for the one open question
-here (whether a real LanBox expects a password over serial at all).
+Over USB, plug in the LanBox and fill in its device in the Connect screen's
+USB field instead (leave host/port blank):
+
+- Linux: usually `/dev/ttyACM0` - check with `ls /dev/tty{ACM,USB}*` after
+  plugging in. On a permission error: `sudo usermod -aG dialout $USER`, then
+  log in again.
+- macOS: `/dev/cu.usbmodem…` - check with `ls /dev/cu.*`.
+
+See "Implementation status" (v6) for the one open question here: whether a
+real LanBox expects a password over USB at all.
 
 **None of this has been tried against real LanBox hardware yet** - both
 paths are only verified against the simulator/pty so far.

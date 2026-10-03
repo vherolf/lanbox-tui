@@ -17,5 +17,14 @@ class NotConnectedError(LanBoxError):
     """An operation was attempted before connecting (or after disconnecting)."""
 
 
+class ConnectionLostError(NotConnectedError):
+    """The connection dropped mid-session (reset, closed, or I/O error)."""
+
+
+class ReplyTimeoutError(ConnectionLostError):
+    """The LanBox didn't answer in time. The connection is dropped, since a
+    late reply would otherwise be mistaken for the answer to the next command."""
+
+
 class AuthenticationError(LanBoxError):
     """The LanBox rejected the connection password."""

@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from lanbox_tui.protocol.errors import ProtocolError
+
 START = 0x2A  # '*'
 END = 0x23  # '#'
 PROMPT_OK = 0x3E  # '>'
@@ -48,8 +50,9 @@ def parse_hex(chunk: str) -> int:
     return int(chunk, 16)
 
 
-class ProtocolFramingError(Exception):
-    """Malformed framing data - kept local to avoid a circular import with errors.py."""
+class ProtocolFramingError(ProtocolError):
+    """Malformed framing data. A `LanBoxError`, so every screen's error
+    handling catches it like any other protocol failure."""
 
 
 def encode_request(code: str, *hex_parts: str) -> bytes:
@@ -107,19 +110,23 @@ class ReplyReader:
                 end_index = self._buffer.find(bytes([END]))
                 if end_index == -1:
                     break  # frame not fully received yet
-                data = self._buffer[1:end_index].decode("ascii")
                 # The data frame is always followed by the ready prompt.
                 if len(self._buffer) <= end_index + 1:
                     break  # wait for the trailing prompt byte
+                raw = bytes(self._buffer[1:end_index])
                 trailing = self._buffer[end_index + 1]
                 if trailing not in (PROMPT_OK, PROMPT_ERROR):
+                    # Drop the frame before raising so the stream resyncs.
+                    del self._buffer[: end_index + 1]
                     raise ProtocolFramingError(
                         f"expected prompt after data frame, got {trailing!r}"
                     )
-                replies.append(Reply(ok=trailing == PROMPT_OK, data=data))
                 del self._buffer[: end_index + 2]
+                replies.append(Reply(ok=trailing == PROMPT_OK, data=raw.decode("ascii", errors="replace")))
             else:
-                raise ProtocolFramingError(f"unexpected byte at start of reply: {first!r}")
+                # Mirror the LanBox's own rule for requests: anything before a
+                # start-of-message is discarded (e.g. an undocumented banner).
+                del self._buffer[0]
         return replies
 
 

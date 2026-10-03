@@ -1,5 +1,5 @@
 from lanbox_tui.protocol import framing
-from lanbox_tui.protocol.framing import ProtocolFramingError, ReplyReader
+from lanbox_tui.protocol.framing import ReplyReader
 
 
 def test_encode_request_matches_pdf_example():
@@ -70,14 +70,13 @@ def test_reply_reader_multiple_replies_in_one_chunk():
     assert replies[1].data == "0102"
 
 
-def test_reply_reader_rejects_garbage():
+def test_reply_reader_discards_garbage():
+    # Same rule the LanBox applies to requests: bytes before a reply start are dropped.
     reader = ReplyReader()
     reader.feed(b"X")
-    try:
-        reader.pop_ready()
-        assert False, "expected ProtocolFramingError"
-    except ProtocolFramingError:
-        pass
+    assert reader.pop_ready() == []
+    reader.feed(b">")
+    assert len(reader.pop_ready()) == 1
 
 
 def test_read_fields_consumes_in_order_and_returns_remainder():

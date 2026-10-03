@@ -110,7 +110,7 @@ class LanBoxState:
         self.gateway = (192, 168, 1, 1)
         self.dmx_out_offset = 0
         self.dmx_channel_count = 512
-        self.baud_rate_param = 3  # 31250 baud (MIDI), the documented default
+        self.baud_rate_param = 0x83  # MIDI mode, as in CommonGetGlobalData's example (p.51)
         self.sysex_device_id = 0
 
         self.layers: dict[int, SimulatedLayer] = {}

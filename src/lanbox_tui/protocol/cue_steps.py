@@ -167,7 +167,11 @@ class CueStep:
 
     def to_hex(self) -> str:
         type_byte = self.kind | (_WAIT_FLAG if self.wait else 0x00)
-        return "".join(f"{b:02X}" for b in (type_byte, *self.params))
+        raw = (type_byte, *self.params)
+        if len(self.params) != 6 or not all(0 <= b <= 0xFF for b in raw):
+            # A value like 300 would otherwise become 3 hex chars and corrupt the frame.
+            raise ValueError(f"Cue Step bytes must be 7 values of 0-255, got {raw!r}")
+        return "".join(f"{b:02X}" for b in raw)
 
     @classmethod
     def from_hex(cls, chunk: str) -> "CueStep":
@@ -178,23 +182,34 @@ class CueStep:
         return cls(wait=bool(type_byte & _WAIT_FLAG), kind=type_byte & ~_WAIT_FLAG, params=tuple(params))
 
 
-def _format_time(seconds: float | None) -> str:
+def format_cue_time(code: int) -> str:
+    """Human-readable time for an Appendix A code. Never raises: data read from
+    a real LanBox can hold codes outside the table (e.g. 0x00)."""
+    if code not in _CODE_TO_SECONDS:
+        return f"code 0x{code:02X}"
+    seconds = _CODE_TO_SECONDS[code]
     return "forever" if seconds is None else f"{seconds:.2f}s"
+
+
+def _layer_label(layer_id: int) -> str:
+    return layer_id_to_label(layer_id) if 1 <= layer_id <= 63 else f"0x{layer_id:02X}"
 
 
 def describe(step: CueStep) -> str:
     """A short, human-readable summary of a Cue Step for the TUI's step list."""
     prefix = "[wait] " if step.wait else ""
+    p = step.params
     if step.kind == STEP_SHOW_SCENE:
-        return f"{prefix}Show Scene - fade {_format_time(step.fade_seconds)}, hold {_format_time(step.hold_seconds)}"
+        return f"{prefix}Show Scene - fade {format_cue_time(p[1])}, hold {format_cue_time(p[2])}"
     if step.kind == STEP_HOLD:
-        return f"{prefix}Hold {_format_time(step.hold_seconds)}"
+        return f"{prefix}Hold {format_cue_time(p[0])}"
     if step.kind == STEP_GO_CUE_STEP:
         return f"{prefix}Go to step {step.target_cue_step}"
     if step.kind == STEP_GO_CUE_STEP_IN_LAYER:
-        layer_label = layer_id_to_label(step.target_layer_id)
-        return f"{prefix}Go to Cue List {step.target_cue_list} step {step.target_cue_step} in Layer {layer_label}"
+        return (
+            f"{prefix}Go to Cue List {step.target_cue_list} step {step.target_cue_step} "
+            f"in Layer {_layer_label(step.target_layer_id)}"
+        )
     if step.kind in _LAYER_CONTROL_KINDS:
-        layer_label = layer_id_to_label(step.params[0])
-        return f"{prefix}{_LAYER_CONTROL_KINDS[step.kind]} {layer_label}"
+        return f"{prefix}{_LAYER_CONTROL_KINDS[step.kind]} {_layer_label(p[0])}"
     return f"{prefix}Type 0x{step.kind:02X} (unsupported)"

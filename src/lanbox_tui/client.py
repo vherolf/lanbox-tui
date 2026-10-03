@@ -19,18 +19,33 @@ from lanbox_tui.protocol.commands import (
     LayerSummary,
 )
 from lanbox_tui.protocol.cue_steps import CueStep
-from lanbox_tui.protocol.errors import AuthenticationError, NotConnectedError
+from lanbox_tui.protocol.errors import (
+    AuthenticationError,
+    ConnectionLostError,
+    NotConnectedError,
+    ReplyTimeoutError,
+)
 from lanbox_tui.protocol.framing import Reply, ReplyReader
 from lanbox_tui.transport.base import Transport
 
 DEFAULT_PASSWORD = "777"
+DEFAULT_TIMEOUT_SECONDS = 5.0
+_MAX_PAGES = 64  # hard stop for paging loops, in case a device's replies don't shrink
 
 
 class LanBoxClient:
-    def __init__(self, transport: Transport, password: str = DEFAULT_PASSWORD) -> None:
+    def __init__(
+        self,
+        transport: Transport,
+        password: str = DEFAULT_PASSWORD,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
         self._transport = transport
         self._password = password
+        self._timeout = timeout
         self._reply_reader = ReplyReader()
+        self._pending: list[Reply] = []
         self._lock = asyncio.Lock()
         self._connected = False
 
@@ -39,36 +54,61 @@ class LanBoxClient:
         return self._connected
 
     async def connect(self) -> None:
-        await self._transport.connect()
-        if self._transport.requires_auth:
-            await self._transport.write(framing.encode_password(self._password))
-            reply = await self._read_one_reply()
-            if not reply.ok:
-                await self._transport.close()
-                raise AuthenticationError("LanBox rejected the connection password")
+        try:
+            await asyncio.wait_for(self._transport.connect(), self._timeout)
+            if self._transport.requires_auth:
+                await asyncio.wait_for(
+                    self._transport.write(framing.encode_password(self._password)), self._timeout
+                )
+                reply = await asyncio.wait_for(self._read_one_reply(), self._timeout)
+                if not reply.ok:
+                    await self._transport.close()
+                    raise AuthenticationError("LanBox rejected the connection password")
+        except asyncio.TimeoutError as exc:
+            await self._drop()
+            raise ReplyTimeoutError(f"no answer from the LanBox within {self._timeout:g}s") from exc
         self._connected = True
 
     async def close(self) -> None:
+        await self._drop()
+
+    async def _drop(self) -> None:
         self._connected = False
-        await self._transport.close()
+        self._pending.clear()
+        self._reply_reader = ReplyReader()
+        try:
+            await self._transport.close()
+        except OSError:
+            pass
 
     async def _read_one_reply(self) -> Reply:
-        while True:
-            ready = self._reply_reader.pop_ready()
-            if ready:
-                return ready[0]
+        while not self._pending:
             chunk = await self._transport.read()
             if not chunk:
                 self._connected = False
-                raise NotConnectedError("connection closed by peer")
+                raise ConnectionLostError("connection closed by the LanBox")
             self._reply_reader.feed(chunk)
+            self._pending.extend(self._reply_reader.pop_ready())
+        return self._pending.pop(0)
 
     async def _request(self, request: bytes) -> Reply:
         if not self._connected:
-            raise NotConnectedError("not connected - call connect() first")
+            raise NotConnectedError("not connected")
         async with self._lock:
-            await self._transport.write(request)
-            return await self._read_one_reply()
+            try:
+                await asyncio.wait_for(self._transport.write(request), self._timeout)
+                return await asyncio.wait_for(self._read_one_reply(), self._timeout)
+            except asyncio.TimeoutError as exc:
+                # A late reply would be mistaken for the next command's answer,
+                # so the session can't be trusted any more - drop it.
+                await self._drop()
+                raise ReplyTimeoutError(f"no answer from the LanBox within {self._timeout:g}s") from exc
+            except OSError as exc:
+                await self._drop()
+                raise ConnectionLostError(f"connection lost: {exc}") from exc
+            except ConnectionLostError:
+                await self._drop()
+                raise
 
     # --- Typed command methods (see protocol/commands.py for the wire format) ---
 
@@ -141,26 +181,50 @@ class LanBoxClient:
     # --- Cue List Control ---
 
     async def get_cue_list_directory(self) -> list[CueListInfo]:
-        infos: list[CueListInfo] = []
+        # The chart calls the parameter a "Cue List Index" without saying
+        # whether it's a position or a list number. Advancing by the page size
+        # and de-duplicating is correct under either reading.
+        by_number: dict[int, CueListInfo] = {}
         start = 1
-        while True:
+        for _ in range(_MAX_PAGES):
             reply = await self._request(commands.build_get_cue_list_directory(start))
             page = commands.parse_get_cue_list_directory(reply)
-            if not page:
+            for info in page:
+                by_number.setdefault(info.number, info)
+            if len(page) < commands.MAX_CUE_LISTS_PER_DIRECTORY_PAGE:
                 break
-            infos.extend(page)
-            if len(page) < 80:
-                break
-            start = page[-1].number + 1
-        return infos
+            start += commands.MAX_CUE_LISTS_PER_DIRECTORY_PAGE
+        return [by_number[number] for number in sorted(by_number)]
 
     async def read_cue_list(self, cue_list: int) -> list[CueStep]:
-        reply = await self._request(commands.build_read_cue_list(cue_list))
-        return commands.parse_read_cue_list(reply)
+        # Lists longer than 70 steps have to be read in several frames (p.39).
+        frame = commands.MAX_CUE_STEPS_PER_FRAME
+        steps: list[CueStep] = []
+        start = 1
+        while start <= commands.MAX_CUE_STEPS_PER_LIST:
+            reply = await self._request(commands.build_read_cue_list(cue_list, start, frame))
+            if start > 1 and not reply.ok:
+                break  # asked past the end of a list that was exactly a frame long
+            page = commands.parse_read_cue_list(reply)
+            steps.extend(page)
+            if len(page) < frame:
+                break
+            start += frame
+        return steps
 
     async def write_cue_list(self, cue_list: int, steps: list[CueStep]) -> None:
-        reply = await self._request(commands.build_write_cue_list(cue_list, steps))
-        commands.parse_write_cue_list(reply)
+        # First frame declares the total, continuation frames declare 0 (p.41).
+        if not 1 <= len(steps) <= commands.MAX_CUE_STEPS_PER_LIST:
+            raise ValueError(
+                f"a Cue List holds 1-{commands.MAX_CUE_STEPS_PER_LIST} steps, got {len(steps)}"
+            )
+        frame = commands.MAX_CUE_STEPS_PER_FRAME
+        for offset in range(0, len(steps), frame):
+            declared = len(steps) if offset == 0 else 0
+            request = commands.build_write_cue_list(
+                cue_list, steps[offset : offset + frame], declared_count=declared
+            )
+            commands.parse_write_cue_list(await self._request(request))
 
     async def remove_cue_list(self, cue_list: int) -> None:
         reply = await self._request(commands.build_remove_cue_list(cue_list))
@@ -171,26 +235,37 @@ class LanBoxClient:
         commands.parse_remove_cue_list_step(reply)
 
     async def read_cue_scene(self, cue_list: int, cue_step: int) -> dict[int, int]:
+        # The reply header is the scene's *total* value count, each reply holds
+        # at most 250 values; page on with the next start channel (p.40).
         values: dict[int, int] = {}
         start_channel: int | None = None
-        while True:
+        for _ in range(_MAX_PAGES):
             reply = await self._request(
                 commands.build_read_cue_scene(cue_list, cue_step, start_channel)
             )
-            page, count = commands.parse_read_cue_scene(reply)
+            page, total = commands.parse_read_cue_scene(reply)
             values.update(page)
-            if count < commands.MAX_CUE_SCENE_VALUES_PER_MESSAGE:
+            if not page or len(values) >= total:
                 break
-            start_channel = (start_channel or 1) + commands.MAX_CUE_SCENE_VALUES_PER_MESSAGE
+            next_start = max(page) + 1
+            if start_channel is not None and next_start <= start_channel:
+                break  # no progress - don't loop on a confused reply
+            start_channel = next_start
         return values
 
     async def write_cue_scene(self, cue_list: int, cue_step: int, values: dict[int, int]) -> None:
+        # First frame declares the total (replacing the scene), continuation
+        # frames declare 0 (p.42).
+        if not values:
+            raise ValueError("a Cue Scene needs at least one channel value")
         items = list(values.items())
-        chunk_size = commands.MAX_CUE_SCENE_VALUES_PER_MESSAGE
-        for i in range(0, len(items), chunk_size):
-            chunk = dict(items[i : i + chunk_size])
-            reply = await self._request(commands.build_write_cue_scene(cue_list, cue_step, chunk))
-            commands.parse_write_cue_scene(reply)
+        frame = commands.MAX_CUE_SCENE_VALUES_PER_MESSAGE
+        for offset in range(0, len(items), frame):
+            declared = len(items) if offset == 0 else 0
+            request = commands.build_write_cue_scene(
+                cue_list, cue_step, dict(items[offset : offset + frame]), declared_count=declared
+            )
+            commands.parse_write_cue_scene(await self._request(request))
 
     # --- Layer Configuration & Chase/Fade Control ---
 
@@ -249,9 +324,11 @@ class LanBoxClient:
         attributes: int = commands.DEFAULT_NEW_LAYER_ATTRIBUTES,
         start_cue_list: int = 0,
         start_cue_step: int = 0,
-        above: int | None = None,
+        under: int | None = None,
     ) -> None:
-        source = above if above is not None else commands.LAYER_CONFIGURE_TOP_OF_MIXING_ORDER
+        # LayerConfigure puts a new Layer directly *underneath* the source Layer,
+        # or on top of the mixing order when there is none (p.24).
+        source = under if under is not None else commands.LAYER_CONFIGURE_TOP_OF_MIXING_ORDER
         request = commands.build_layer_configure_long(
             commands.LAYER_CONFIGURE_NEW_OR_DELETE_MARKER,
             source,

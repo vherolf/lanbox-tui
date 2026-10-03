@@ -210,12 +210,22 @@ class LayerStatus:
     active_cue_list: int
     active_cue_step: int
     chase_mode: int
-    layer_speed_percent: int
+    layer_speed: int  # raw 0-255; speed factor = 128 / (255 - value), see chase_speed_percent()
     manual_fade_type: int
     manual_fade_time_code: int
-    transparency_depth_percent: int
+    transparency_depth: int  # raw 0-255 = 0-100%
     pause_status: bool
     auto_activate_status: bool
+
+
+def chase_speed_percent(raw: int) -> float | None:
+    """LayerSetChaseSpeed's formula, 128 / (255 - S) x 100% (p.30); None = infinite (S=255)."""
+    return None if raw >= 255 else 128 / (255 - raw) * 100
+
+
+def transparency_percent(raw: int) -> float:
+    """0 = 0%, 255 = 100% (LayerSetTransparencyDepth, p.22)."""
+    return raw * 100 / 255
 
 
 def build_get_layer_status(layer_id: int) -> bytes:
@@ -235,10 +245,10 @@ def parse_get_layer_status(reply: Reply) -> LayerStatus:
         active_cue_list=fields["active_cue_list"],
         active_cue_step=fields["active_cue_step"],
         chase_mode=fields["chase_mode"],
-        layer_speed_percent=fields["layer_speed"],
+        layer_speed=fields["layer_speed"],
         manual_fade_type=fields["manual_fade_type"],
         manual_fade_time_code=fields["manual_fade_time_code"],
-        transparency_depth_percent=fields["transparency_depth"],
+        transparency_depth=fields["transparency_depth"],
         pause_status=bool(fields["pause_status"]),
         auto_activate_status=bool(fields["auto_activate_status"]),
     )
@@ -406,7 +416,9 @@ def parse_layer_previous_step(reply: Reply) -> None:
 # --- Cue List Control --------------------------------------------------------
 
 MAX_CUE_STEPS_PER_LIST = 99
-MAX_CUE_SCENE_VALUES_PER_MESSAGE = 250
+MAX_CUE_STEPS_PER_FRAME = 70  # longer lists need multiple frames (p.39/41)
+MAX_CUE_SCENE_VALUES_PER_MESSAGE = 250  # larger scenes need multiple frames (p.40/42)
+MAX_CUE_LISTS_PER_DIRECTORY_PAGE = 80  # p.38
 
 
 @dataclass(frozen=True)
@@ -456,10 +468,18 @@ def parse_read_cue_list(reply: Reply) -> list[CueStep]:
     return [CueStep.from_hex(data[i : i + 14]) for i in range(0, len(data), 14)]
 
 
-def build_write_cue_list(cue_list: int, steps: list[CueStep]) -> bytes:
-    if not 1 <= len(steps) <= MAX_CUE_STEPS_PER_LIST:
-        raise ValueError(f"a Cue List holds 1-{MAX_CUE_STEPS_PER_LIST} steps, got {len(steps)}")
-    parts = [hex16(cue_list), hex8(len(steps))]
+def build_write_cue_list(
+    cue_list: int, steps: list[CueStep], *, declared_count: int | None = None
+) -> bytes:
+    """One CueListWrite frame. For lists over 70 steps (see
+    `LanBoxClient.write_cue_list`), the first frame declares the list's total
+    step count and continuation frames declare 0 (reference chart p.41)."""
+    if not 1 <= len(steps) <= MAX_CUE_STEPS_PER_FRAME:
+        raise ValueError(f"a CueListWrite frame holds 1-{MAX_CUE_STEPS_PER_FRAME} steps, got {len(steps)}")
+    declared = len(steps) if declared_count is None else declared_count
+    if not 0 <= declared <= MAX_CUE_STEPS_PER_LIST:
+        raise ValueError(f"a Cue List holds at most {MAX_CUE_STEPS_PER_LIST} steps, got {declared}")
+    parts = [hex16(cue_list), hex8(declared)]
     parts.extend(step.to_hex() for step in steps)
     return framing.encode_request("AA", *parts)
 
@@ -476,9 +496,9 @@ def build_read_cue_scene(cue_list: int, cue_step: int, start_channel: int | None
 
 
 def parse_read_cue_scene(reply: Reply) -> tuple[dict[int, int], int]:
-    """Returns (values, count) - `count` is how many pairs this reply carried,
-    used by the caller to decide whether to page for more (see CueSceneRead's
-    caller in client.py for the paging loop)."""
+    """Returns (values, total) - `total` is the header's value count for the
+    *whole* scene ("the number of Values in the Cue Scene", p.40); one reply
+    carries at most 250 of them. See `LanBoxClient.read_cue_scene` for paging."""
     _require_ok(reply, command="CueSceneRead")
     data = reply.data or ""
     header, remaining = read_fields(data, [("scene_flag", 1), ("channel_count", 2)])
@@ -489,13 +509,19 @@ def parse_read_cue_scene(reply: Reply) -> tuple[dict[int, int], int]:
     return values, header["channel_count"]
 
 
-def build_write_cue_scene(cue_list: int, cue_step: int, values: dict[int, int]) -> bytes:
+def build_write_cue_scene(
+    cue_list: int, cue_step: int, values: dict[int, int], *, declared_count: int | None = None
+) -> bytes:
+    """One CueSceneWrite frame. For scenes over 250 values (see
+    `LanBoxClient.write_cue_scene`), the first frame declares the scene's total
+    value count and continuation frames declare 0 (reference chart p.42)."""
     if not 1 <= len(values) <= MAX_CUE_SCENE_VALUES_PER_MESSAGE:
         raise ValueError(
             f"a single CueSceneWrite message holds 1-{MAX_CUE_SCENE_VALUES_PER_MESSAGE} "
             f"channel values, got {len(values)}"
         )
-    parts = [hex16(cue_list), hex8(cue_step), hex8(0), hex16(len(values))]
+    declared = len(values) if declared_count is None else declared_count
+    parts = [hex16(cue_list), hex8(cue_step), hex8(0), hex16(declared)]
     for channel, value in values.items():
         parts.append(hex16(channel))
         parts.append(hex8(value))
@@ -646,7 +672,23 @@ def parse_layer_configure(reply: Reply) -> None:
 
 # --- LanBox Global Settings (reference chart pp. 7-8, 50-54) ----------------
 
-BAUD_RATE_NAMES = {0: "38400", 1: "19200", 2: "9600", 3: "31250 (MIDI)"}
+# CommonSetBaudRate configures the MIDI port (5-pin DIN), NOT the USB link -
+# the LCedit manual (p.57) shows it as "Serial port rate" next to a "Use
+# serial/MIDI port for MIDI" checkbox; with MIDI off at 9600 baud the port's
+# pin 4 becomes a serial transmit line. Values 0x80-0x83 = MIDI mode (always
+# 31250 baud); 0-3 = plain serial at the Table 8 rate (reference chart p.52).
+MIDI_MODE_FLAG = 0x80
+_SERIAL_BAUD = {0: 38400, 1: 19200, 2: 9600, 3: 31250}
+# Cycle order for the settings screen: MIDI (factory default) first.
+BAUD_RATE_OPTIONS = [0x83, 0x02, 0x01, 0x00, 0x03]
+
+
+def describe_baud_rate(param: int) -> str:
+    if param & MIDI_MODE_FLAG and (param & 0x7F) in _SERIAL_BAUD:
+        return "MIDI (31250 baud)"
+    if param in _SERIAL_BAUD:
+        return f"serial out, {_SERIAL_BAUD[param]} baud"
+    return f"unknown (0x{param:02X})"
 MAX_NAME_LENGTH = 13
 
 _GLOBAL_DATA_HEAD_SPEC = [
