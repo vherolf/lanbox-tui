@@ -23,6 +23,7 @@ jobs:
   linux:
     name: Linux x86_64
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Build on Debian 12 (glibc 2.36) rather than the runner's newer Ubuntu,
     # so the binary also runs on older distributions.
     container: python:3.12-bookworm
@@ -56,6 +57,7 @@ jobs:
   macos:
     name: macOS arm64
     runs-on: macos-latest # Apple Silicon
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 

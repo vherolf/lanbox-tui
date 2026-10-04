@@ -170,7 +170,16 @@ async def test_directory_paging_with_sparse_cue_list_numbers(simulator):
 
 
 async def _serve(handler):
-    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    async def closing_handler(reader, writer):
+        # Always close the server side: on Python 3.12, `async with server`
+        # waits for every connection to close, so a handler that returns
+        # without closing its writer hangs the test forever.
+        try:
+            await handler(reader, writer)
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(closing_handler, "127.0.0.1", 0)
     host, port = server.sockets[0].getsockname()[:2]
     return server, host, port
 
