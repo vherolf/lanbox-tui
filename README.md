@@ -270,7 +270,29 @@ chart's own command names so it's traceable back to the spec:
   simulator so far - see `simulator/state.py` for what it does and doesn't
   model (no fade/cue-timing simulation).
 
-## Setup
+## Download (no Python needed)
+
+Every major release (v4.0.0, v5.0.0, ...) has ready-made binaries attached
+on the [Releases page](https://github.com/vherolf/lanbox-tui/releases):
+`lanbox-tui-<version>-linux-x86_64.tar.gz` and
+`lanbox-tui-<version>-macos-arm64.tar.gz` (Apple Silicon). Each contains
+`lanbox-tui` and `lanbox-simulator`.
+
+```sh
+tar -xzf lanbox-tui-*-linux-x86_64.tar.gz
+./lanbox-tui
+```
+
+The Linux binary needs glibc 2.36 or newer (Debian 12, Ubuntu 23.04, or
+later). The macOS binary isn't signed, so macOS blocks a downloaded copy the
+first time: run `xattr -d com.apple.quarantine lanbox-tui lanbox-simulator`
+once after unpacking.
+
+They're built by `.github/workflows/release-binaries.yml` whenever a
+`vN.0.0` tag is pushed (tests, then PyInstaller, then a smoke test of the
+actual binaries); `packaging/build.sh` does the same build locally.
+
+## Setup (from source)
 
 ```sh
 python3 -m venv venv

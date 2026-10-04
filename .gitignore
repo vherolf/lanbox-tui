@@ -9,3 +9,5 @@ venv/
 # Vendor manuals - copyrighted by LanBox Products, kept locally for reference
 # only, not redistributed via this repo.
 *.pdf
+build/
+dist/
